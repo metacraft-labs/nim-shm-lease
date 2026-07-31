@@ -11,4 +11,8 @@ test-logs/
 tests/test_shm_lease
 tests/test_shm_lease_hooks
 tests/test_shm_lease_multiprocess
+tests/test_shm_lease_waitword
+tests/test_shm_lease_wait_multiprocess
 benchmarks/bench_claim
+benchmarks/bench_wait
+benchmarks/probe_fastpath

@@ -24,10 +24,18 @@
 ## the real obstacle: a pure CAS loop admits whoever arrives first and happens to
 ## fit, which STARVES large claims. This module is therefore a correct
 ## no-overcommit reservation and **not** an admission policy. Anti-starvation
-## (SM-4) belongs to the flat-combining arbiter of M5/M6, blocking to M3,
-## observations to M4, and kill-injection + reclamation to M7. Nothing here should
-## be read as a claim that first-come-if-it-fits is an acceptable admission policy;
-## it is the substrate the policy is built on.
+## (SM-4) belongs to the flat-combining arbiter of M5/M6, observations to M4, and
+## kill-injection + reclamation to M7. Nothing here should be read as a claim that
+## first-come-if-it-fits is an acceptable admission policy; it is the substrate the
+## policy is built on.
+##
+## **M3 has since landed alongside it**: `shm_lease/waitword` is the futex-class
+## cross-process blocking wrapper (SM-1, SM-2), re-exported from this module. It is
+## a SEPARATE segment with its own format, deliberately — the budget segment's
+## layout and format version are untouched by M3, and the header words
+## `LhOffReserved1..5` remain reserved for M5's combiner role/sequence and M7's
+## reclamation epoch. Claiming is still non-blocking (SM-8); the wait primitive is
+## what M5 will use to park a client that has nothing else to run.
 ##
 ## WHAT IT DOES GUARANTEE, and how each is proven:
 ##
@@ -84,8 +92,10 @@
 ## **enforced, not merely documented**: `claimWords` REFUSES a non-ascending index
 ## list with `csOutOfOrder`, and there is a test for it.
 
-import ./shm_lease/[hooks, packed, anchor]
+import ./shm_lease/[hooks, packed, anchor, waitword, syscount]
 export packed
+export waitword
+export syscount
 export hooks.SchedulePoint, hooks.scheduleHooksEnabled
 export anchor.AnchorVerdict, anchor.bootId, anchor.processStartTime,
   anchor.pidAlive, anchor.anchorVerdict, anchor.ownerAliveAnchor

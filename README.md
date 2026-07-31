@@ -11,15 +11,16 @@ Sibling to [`nim-shm-queue`](../nim-shm-queue) (MPSC ring) and
 design authority is
 `reprobuild-specs/RunQuota-Shared-Memory-Transport.md`.
 
-## Status: M2 only
+## Status: M2 + M3
 
-M2 is the spec's *"§1 the fit check and claim are the easy part"*, and nothing
-more. Read the scope honestly before building on it:
+M2 is the spec's *"§1 the fit check and claim are the easy part"*; M3 is
+*"Waiting Without Spinning"*. Nothing beyond those two. Read the scope honestly
+before building on it:
 
 | Campaign milestone | What it adds | Here? |
 |---|---|---|
 | **M2** | packed-budget multi-dimensional reservation, no overcommit, position independence | **yes** |
-| M3 | futex-class blocking (`futex` / `os_sync_wait_on_address`) | no |
+| **M3** | futex-class cross-process blocking (`futex` / `os_sync_wait_on_address`), per-waiter wait slots | **yes** |
 | M4 | observation ring (built on `nim-shm-queue`) | no |
 | M5 | flat-combining arbiter, per-waiter grant slots, grant-then-wake | no |
 | M6 | anti-starvation (bounded wait for large claims) | no |
@@ -103,11 +104,34 @@ Per the design spec's *"The engineering playbook does transfer"*:
 
 ## Capability record
 
+### The reservation (M2)
+
 | Platform | Status | Note |
 |---|---|---|
 | Linux (x86-64, aarch64) | supported | `boot_id` from `/proc/sys/kernel/random/boot_id`; process start time is field 22 of `/proc/<pid>/stat` |
 | macOS 11+ (arm64, x86-64) | supported | process start time via `sysctl(KERN_PROC/KERN_PROC_PID)` → `kp_proc.p_starttime`; boot identity derived from pid 1's start time |
 | Windows | **not supported** — no-op arm | Deliberate, and inherited from the campaign: the shared-memory transport's Windows *wake* path needs named kernel objects because `WaitOnAddress` is documented as within-process only. The M2 reservation itself would port, but shipping it without M3's wake path would be a half-capability, so Windows reports unavailable and the gap is recorded here rather than silently omitted. |
+
+### The blocking wrapper (M3)
+
+| Platform | Primitive | Minimum version | Cross-process | Note |
+|---|---|---|---|---|
+| Linux (x86-64, aarch64) | `futex(FUTEX_WAIT / FUTEX_WAKE)` **without** `FUTEX_PRIVATE_FLAG` | any | ✓ | A shared futex keys on the underlying **inode + offset**, not the virtual address, which is what lets a file-backed segment mapped at a different base in every process still block correctly. **UNEXERCISED: never run on Linux.** |
+| macOS (arm64, x86-64) | `os_sync_wait_on_address` / `os_sync_wake_by_address_any` / `..._all` with `OS_SYNC_*_SHARED` | **14.4** | ✓ | The symbols are **weak-imported and NULL-checked at run time**, so a binary built against a 14.4 SDK still launches on an older macOS and `waitWordAvailable()` simply returns false there. The minimum version is recorded in `WaitWordMinMacOsVersion` and asserted by the suite. |
+| Windows | — | — | **✗** | **OUT OF SCOPE, recorded not omitted.** `WaitOnAddress` is documented as working only within a process; a cross-process wake needs named kernel objects (a per-waiter named event or semaphore). Note the asymmetry for whoever takes it up: the *fast path* (no wait) still costs zero syscalls on Windows, and only the **wake** needs the named object. |
+
+`waitWordAvailable()` is the runtime gate and `WaitWordBackend` names the primitive
+actually selected, so a caller can report what it got rather than assume.
+
+**On macOS, a wait word must be on a page this process has already touched.**
+`os_sync_wait_on_address` returns `EFAULT` for an address whose page has not yet
+been faulted in — even though the mapping is valid and an ordinary load from it
+succeeds. That is exactly the state a forked child is in after a fresh `MAP_FIXED`
+of the segment, so a park issued before any access fails instantly instead of
+blocking, which reads as "the primitive does not work". `waitOn` therefore
+prefaults, and `tests/test_shm_lease_waitword.nim` exhibits both halves on two
+separate fresh mappings — one untouched (`EFAULT`), one whose only access is the
+prefault (blocks and times out cleanly). Reproduced on Darwin 25.5 / arm64.
 
 **Page size is a host property, and it bit us.** `MAP_FIXED` needs a page-aligned
 address; pages are 4 KiB on x86-64 Linux and Intel macOS but **16 KiB on Apple
@@ -143,14 +167,42 @@ echo c.remainingVec(MachineBudgetIndex), " of ", c.capacityVec(MachineBudgetInde
 doAssert c.noOvercommitAnywhere()
 ```
 
+Blocking (M3) lives in its own segment of per-waiter slots — a shared wait word
+would reintroduce the thundering herd by construction:
+
+```nim
+# OWNER: one wait slot per waiter.
+var w = createWaitSegment(waitPath, slots = 64)
+
+# WAITER: remember what you saw, then block until it changes, RE-VALIDATING after
+# every wake (spurious wakeups are guaranteed by every primitive underneath).
+var c = attachWaitSegment(waitPath)
+let seen = c.slotValue(mySlot)
+if c.awaitGrant(mySlot, seen) == wrNotEqual:
+  let grant = c.slotPayload(mySlot)      # published BEFORE the word was bumped
+
+# WAKER: assign first, then wake — never wake-then-retry.
+discard w.publishGrant(mySlot, grantValue)
+```
+
 ## Test & benchmark
 
 ```bash
-just test      # unit + the multi-process M2 gate + deterministic interleavings
-just bench     # POC-local claim/release cost (the socket comparison is M1/M8)
-just soak 20   # the same gate harness, 20x the rounds per child
-just lint      # nim check over the library and every test
+just test           # unit + the M2 and M3 gates + deterministic interleavings
+just bench          # POC-local claim/release and wait/wake cost (M1/M8 own the
+                    # socket comparison)
+just soak 20        # the M2 gate harness, 20x the rounds per child
+just test-syscalls  # EXTERNAL syscall counting for SM-2 (strace / dtruss)
+just lint           # nim check over the library and every test
 ```
+
+`just test-syscalls` is **not** part of `test`: on macOS `dtrace`/`dtruss` need
+root *and* a SIP configuration that permits DTrace, and refuse on a stock host.
+The suite's own SM-2 assertions therefore use the kernel's per-task syscall
+counter (`task_info` / `TASK_EVENTS_INFO`), which is exact, needs no privileges,
+and is calibrated in-suite before it is trusted. On Linux there is no cheap
+in-process equivalent, so `strace -c` is the only route there and the in-suite
+SM-2 assertions announce themselves as skipped rather than passing vacuously.
 
 `nimble test` runs the same three files, but only once the repo has a commit
 (nimble derives the package version from the VCS revision), so `just` is the
@@ -220,5 +272,66 @@ Proves **SM-7** and **partial SM-5**. Not proven here: **SM-6** (no leaked
 capacity) — this test deliberately exhibits the leak, since the children exit while
 still holding reservations and the parent has to give that capacity back by hand.
 Reclaiming it automatically is M7.
+
+### What the M3 gate proves
+
+`tests/test_shm_lease_wait_multiprocess.nim` reuses M2's harness shape — one
+`PROT_NONE` region reserved *before* the fork, `sysconf(_SC_PAGESIZE)` stride,
+`MAP_FIXED` per child, pipe start barrier, report pipe drained before reaping —
+and asserts, in five phases:
+
+1. **A waiter blocks and another process wakes it, at differing virtual bases.**
+   The child parks at its `MAP_FIXED` base; the parent publishes and wakes through
+   its own, different, mapping. The parent observes the waiter count from its
+   mapping while the child is inside the kernel. This is simultaneously SM-7 for
+   the wait word and the direct assertion of the keying rule (inode + offset on
+   Linux, `OS_SYNC_*_SHARED` on macOS) rather than an assumption about it.
+2. **Spurious wakeups are tolerated.** The parent injects forced wakes with the
+   value *unchanged* — exactly the event every one of these primitives is
+   permitted to manufacture — and the child must re-validate and re-park rather
+   than report a grant that does not exist. Delivery is *confirmed* through a
+   shared-memory progress counter and re-issued if lost, because a waiter is
+   registered a few instructions before it is actually in the kernel and a wake in
+   that window is legitimately lost.
+3. **SM-1: a blocked waiter consumes no measurable CPU** over a multi-second
+   block — with a **spinning child running the same window as the negative
+   control**, required to *exceed* the same limit. Measured on Darwin 25.5 /
+   arm64: 35–51 µs of CPU over a 3.0 s block, against 3.01 s for the spinner —
+   a ratio of 59,000–86,000x, with the limit set at 20 ms.
+4. **SM-2: the uncontended fast path costs zero syscalls**, measured in the child
+   at its `MAP_FIXED` base with the kernel's own counter: 200,000 fast-path waits
+   → **0** syscalls, 200,000 no-waiter wakes → **0**, control of 200 forced wakes
+   → **200**.
+5. **The cross-process scope is load-bearing.** Two children park under an
+   identical schedule, one with the cross-process scope and one with the
+   process-local one (`FUTEX_*_PRIVATE` / `OS_SYNC_WAIT_ON_ADDRESS_NONE`). The
+   shared waiter is woken in ~311 ms; the process-local waiter is *not* woken and
+   sits out its full 1.5 s timeout.
+
+Every one of those was **mutation-tested** — removing the fast paths turns 0/0
+syscalls into 200,000/200,000; making `waitOn` return without parking turns the
+blocked child's 51 µs into 3.72 s of CPU; collapsing the process-local scope onto
+the shared one makes the keying control return in 303 ms instead of timing out;
+removing the prefault turns a clean timeout into `EFAULT`.
+
+Proves **SM-1** and **SM-2**. Not proven here: SM-3 (no wake amplification), SM-4
+(bounded wait for large claims), SM-6 (no leaked capacity) and SM-8, which belong
+to M5/M6/M7 and are not attempted.
+
+### Fast-path cost (M3)
+
+POC-local, Darwin 25.5 / arm64, one release run — read the variance warning in
+`benchmarks/bench_wait.nim` before quoting any of it:
+
+| operation | cost | syscalls |
+|---|---|---|
+| uncontended wait (word already differs) | ~2.2 ns | **0** over 5,000,000 ops |
+| uncontended wake (nobody parked) | ~2.4 ns | **0** over 5,000,000 ops |
+| forced wake syscall (the fast path bypassed) | ~430 ns | 1 per op |
+| park + wake round trip between two threads | ~5.8 µs | slow path, for scale |
+
+The middle two rows are the point: skipping the wake syscall when the word records
+no waiter is ~177x cheaper than issuing it, and that is the case a naive
+implementation gets wrong on *every* release.
 
 Apache-2.0.

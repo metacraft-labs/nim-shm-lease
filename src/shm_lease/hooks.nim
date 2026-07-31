@@ -37,6 +37,22 @@ type
     slpBeforeSegmentRename  ## temp segment complete; about to rename it into its
                             ## FINAL name (the publish-before-write boundary)
     slpAfterSegmentRename   ## the segment is now discoverable under its final name
+    # --- M3: the futex-class blocking wrapper (`shm_lease/waitword`) ----------
+    #
+    # The design spec lists "deterministic interleaving tests at every CAS,
+    # publish, and role-transfer site" as a condition of adoption, and the wait
+    # path adds three race sites the budget CAS does not have: the LOST-WAKEUP
+    # window between a waiter registering and re-checking, the park itself, and
+    # the waker's decision to skip the syscall because the word records no waiter.
+    # Each gets a named seam.
+    slpBeforeWaiterRegister ## about to publish "a waiter exists" on a wait word
+    slpAfterWaiterRegister  ## registered; about to RE-CHECK the value. Pausing
+                            ## here is what lets a test drive the lost-wakeup race
+    slpBeforeWaitPark       ## about to enter the kernel and sleep
+    slpAfterWaitPark        ## returned from the kernel (woken, spurious, or timeout)
+    slpBeforeWakePublish    ## about to release-store the new wait-word value
+    slpBeforeWakeSyscall    ## waiters observed non-zero; about to enter the kernel
+    slpAfterWakeSyscall     ## the wake syscall returned
 
   ScheduleHook* = proc (point: SchedulePoint) {.gcsafe, raises: [].}
 

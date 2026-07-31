@@ -577,6 +577,16 @@ suite "M2 gate: N processes over one shared packed budget":
     # skipped sample, which would silently weaken the no-overcommit evidence.
     for rep in run.reports:
       check rep.roundsDone >= uint64(rounds)
+      # ...and the hard `maxRounds` cap was NOT reached. A child that exits via the
+      # cap left the loop without the parent's stop gate, which silently degrades
+      # this run to start-barrier-only reliability — the configuration that was
+      # measured to leave 23% of runs with a non-overlapping pair. The simultaneity
+      # witness below is asserted independently of how a child exited, so a
+      # cap-exit is not a vacuity path; but it IS a change of regime, and the point
+      # of this assertion is that the gate says so instead of quietly carrying on.
+      # (Measured: per-child rounds run ~20.7k-27.4k against a 160k cap, so the
+      # margin is roughly 6-8x, not a tight fit.)
+      check rep.roundsDone < uint64(rounds * 8)
       check rep.samples == rep.roundsDone + (rep.claims - rep.heldCount) + 1'u64
     check run.parentSamples == uint64(ParentSampleBudget)
 

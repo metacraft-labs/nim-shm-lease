@@ -67,7 +67,27 @@ suite "schedule-hook coverage at every CAS and publish site":
     # A two-word claim refused on the pool word: rollback CAS on the machine word.
     check l.claim(vec(2, 2, 2, 2), r, poolIndex = 0) == csRefused
 
+    # --- M3: the wait/wake seams -------------------------------------------
+    # The design spec asks for deterministic interleaving tests at every CAS,
+    # publish AND wait/wake site, so the blocking wrapper's seams are exercised in
+    # the same cycle: a slow-path wait (register, re-check, park, return), a
+    # publish, and a forced wake syscall.
+    let wpath = freshPath("coverage-wait")
+    defer: cleanup(wpath)
+    var ws = createWaitSegment(wpath, 4)
+    check ws.available
+    let woff = ws.slotOffset(0)
+    prefaultWaitWord(ws.base, woff)
+    # Value MATCHES, so this takes the slow path: register, re-check, park. The
+    # short timeout is what makes it return without a second thread.
+    check waitOn(ws.base, woff, ws.slotValue(0), timeoutNs = 5_000_000'i64) ==
+      wrTimedOut
+    check ws.publishGrant(0, 1'u64) == wkNoWaiters   # publish; wake fast-paths
+    discard wakeRaw(ws.base, woff)                   # forced: the wake syscall seam
+    ws.detach()
+
     setScheduleHook(nil)
+    # A seam nothing ever reaches is not a seam.
     for p in SchedulePoint:
       check p in gSeen
     l.detach()
@@ -286,3 +306,125 @@ suite "deterministic CAS races":
       l.packedCapacity(MachineBudgetIndex)
     check not l.releaseVec(gClaimVec)          # ...and there is nothing else to give
     l.detach()
+
+
+# --- M3: the compare-and-park window, driven deterministically ---------------
+#
+# `waitOn`'s slow path is: register as a waiter, RE-CHECK the value, then park.
+# It is worth being exact about which step buys what, because the two are easy to
+# conflate and only one of them is a correctness argument:
+#
+#   * The KERNEL's compare-and-park is the correctness mechanism. A publish that
+#     lands after the waiter decided to sleep but before it is actually inside the
+#     kernel cannot strand it, because the kernel compares the word atomically with
+#     the block and returns immediately when it no longer matches. The first test
+#     below drives precisely that interleaving through `slpBeforeWaitPark` and
+#     issues NO WAKE SYSCALL AT ALL, so the only thing that can save the waiter is
+#     the kernel's compare.
+#   * The userspace re-check after registering is a SYSCALL-AVOIDANCE step. The
+#     third test shows it: under the same publish, a waiter paused at
+#     `slpAfterWaiterRegister` returns without ever entering the kernel.
+#
+# The second test is the control that gives the first one teeth — the identical
+# schedule with nothing published must sit out its whole timeout.
+
+var gWaitPath: string
+var gWaitRc: WaitResult
+var gWaitParks: uint64
+var gWaitWallMs: int
+
+proc waiterHookThread(unused: int) {.thread.} =
+  {.cast(gcsafe).}:
+    var ws = attachWaitSegment(gWaitPath)
+    doAssert ws.available
+    let off = ws.slotOffset(0)
+    prefaultWaitWord(ws.base, off)
+    let seen = ws.slotValue(0)
+    resetWaitWordCounters()
+    setScheduleHook(pauseHook)
+    let t0 = epochTime()
+    gWaitRc = waitOn(ws.base, off, seen, timeoutNs = 1_000_000_000'i64)
+    gWaitWallMs = int((epochTime() - t0) * 1000)
+    gWaitParks = wwParks
+    setScheduleHook(nil)
+    ws.detach()
+
+suite "M3 deterministic interleavings: publish vs park":
+  test "a publish landing just before the park is caught by the kernel's compare":
+    let path = freshPath("cmppark")
+    defer: cleanup(path)
+    var ws = createWaitSegment(path, 4)
+    check ws.available
+    gWaitPath = path
+    gHookPoint = slpBeforeWaitPark
+    resetBarrier()
+
+    var t: Thread[int]
+    createThread(t, waiterHookThread, 0)
+    # The waiter has registered, re-checked, and is about to enter the kernel. It
+    # is NOT yet inside it.
+    check waitArrived(1, 10.0)
+    check ws.slotWaiters(0) == 1'u32
+
+    # Publish with NO WAKE. A wake syscall issued now would find nobody parked
+    # anyway (`wkNobodyParked`), so if the waiter comes back it can only be because
+    # the kernel compared the word as it blocked.
+    publishValue(ws.base, ws.slotOffset(0), ws.slotValue(0) + 1)
+    gRelease.store(1)
+    joinThread(t)
+
+    check gWaitRc != wrTimedOut
+    check gWaitWallMs < 500
+    check gWaitParks == 1'u64          # it DID enter the kernel, and came straight back
+    ws.detach()
+
+  test "the same schedule with nothing published sits out the whole timeout":
+    # The control. Without it, "the waiter came back quickly" could equally mean
+    # the wait never blocked in the first place.
+    let path = freshPath("cmppark-ctl")
+    defer: cleanup(path)
+    var ws = createWaitSegment(path, 4)
+    check ws.available
+    gWaitPath = path
+    gHookPoint = slpBeforeWaitPark
+    resetBarrier()
+
+    var t: Thread[int]
+    createThread(t, waiterHookThread, 0)
+    check waitArrived(1, 10.0)
+    gRelease.store(1)                 # released, but nothing was published
+    joinThread(t)
+
+    check gWaitRc == wrTimedOut
+    check gWaitWallMs >= 900
+    check gWaitParks == 1'u64
+    ws.detach()
+
+  test "a publish before the re-check costs no syscall at all":
+    # The syscall-avoidance half: paused between registering and re-checking, a
+    # waiter that finds the value already changed returns WITHOUT parking. This is
+    # SM-2's fast path reached from the slow path's own window, and the park count
+    # is what proves the kernel was never entered.
+    let path = freshPath("recheck")
+    defer: cleanup(path)
+    var ws = createWaitSegment(path, 4)
+    check ws.available
+    gWaitPath = path
+    gHookPoint = slpAfterWaiterRegister
+    resetBarrier()
+
+    var t: Thread[int]
+    createThread(t, waiterHookThread, 0)
+    check waitArrived(1, 10.0)
+    check ws.slotWaiters(0) == 1'u32
+    # A wake issued here reports `wkNobodyParked`: the syscall WAS made and found
+    # nobody in the kernel. That is a different outcome from the syscall-free
+    # `wkNoWaiters`, and keeping them distinct is what lets SM-2 be stated exactly.
+    check ws.publishGrant(0, 0xFEED'u64) == wkNobodyParked
+    gRelease.store(1)
+    joinThread(t)
+
+    check gWaitRc == wrNotEqual
+    check gWaitParks == 0'u64          # <-- never entered the kernel
+    check gWaitWallMs < 500
+    ws.detach()
