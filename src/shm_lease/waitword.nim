@@ -402,8 +402,17 @@ static int shmLeaseWwWake(void *addr, int all, int shared, int *errOut) {
     scheduleHook(slpAfterWakeSyscall)
     waitWordLastErrno = err
     inc wwWakeSyscalls
-    if rc >= 0: return wkWoke
-    if err == WwErrNoWaiters and err != 0: return wkNobodyParked
+    when defined(linux):
+      # FUTEX_WAKE returns the NUMBER of waiters woken and reports "nobody was
+      # parked" as a successful 0, not as an errno. `rc >= 0` therefore called
+      # every wake `wkWoke`, including the ones that found the kernel empty --
+      # collapsing the two outcomes this type exists to keep apart. The count
+      # is right there in the return value; use it.
+      if rc > 0: return wkWoke
+      if rc == 0: return wkNobodyParked
+    else:
+      if rc >= 0: return wkWoke
+      if err == WwErrNoWaiters and err != 0: return wkNobodyParked
     wkError
 
   proc waitOn*(base: ShmBase; off: int; expected: uint32;
