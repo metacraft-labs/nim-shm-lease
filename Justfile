@@ -9,6 +9,8 @@
 ## runner needs no commit, so it is the blessed runner during development — the
 ## same convention as `nim-shm-gset`.
 
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
 alias t := test
 alias fmt := format
 
