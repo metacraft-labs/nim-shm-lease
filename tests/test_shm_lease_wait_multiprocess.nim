@@ -247,6 +247,15 @@ proc childMain(childId: int; role: ChildRole; slot: int; path: string;
     # `awaitGrant`, so the child can publish its park count into shared memory
     # after every kernel return — which is how the parent knows a spurious wake
     # was actually delivered instead of guessing with a sleep.
+    #
+    # THIS DELIBERATELY VIOLATES `publishGrant`'s stated precondition (at most one
+    # outstanding grant per slot): it republishes into `ProgressSlot` on every park
+    # with no consumption handshake. It is sound HERE only because `ProgressSlot` is
+    # used as a MONOTONE COUNTER, not as a message queue — `awaitProgress` polls
+    # `slotPayload(ProgressSlot) >= atLeast`, so an overwritten value loses nothing,
+    # and nothing ever waits on that slot's wait word, so no wake can be lost either.
+    # Do not copy this shape for a slot whose payload carries a per-grant message;
+    # see `publishGrant`'s docstring for what breaks.
     var parks = 0
     var rc = wrNotEqual
     while true:

@@ -289,12 +289,12 @@ precondition.
 
 **Why this is not yet a live bug — and note that the real reason STRENGTHENS the
 finding rather than weakening it.** The precondition is **already violated
-in-tree**: `tests/test_shm_lease_wait_multiprocess.nim:257` calls
+in-tree**: `tests/test_shm_lease_wait_multiprocess.nim:266` calls
 `publishGrant(ProgressSlot, uint64(parks))` *inside the waiter loop, on every
 kernel return, with nothing waiting to consume it* — so the "at most one
 outstanding grant per slot" rule is broken on essentially every iteration. It is
 harmless **there, and only there**, because of a property of that slot's one
-consumer: `awaitProgress` (`:418`) polls `slotPayload(ProgressSlot) >= atLeast`,
+consumer: `awaitProgress` (`:427`) polls `slotPayload(ProgressSlot) >= atLeast`,
 a **monotone level rather than a per-grant message**, and never touches that
 slot's wait word at all — so an intermediate value that gets overwritten is
 simply unobservable. Every site that *does* treat a payload as a **distinct

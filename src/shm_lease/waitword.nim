@@ -811,6 +811,41 @@ static int shmLeaseWwWake(void *addr, int all, int shared, int *errOut) {
       scope: WaitScope = wsShared): WakeResult =
     ## Publish a grant into a waiter's own slot and wake that waiter.
     ##
+    ## **PRECONDITION — AT MOST ONE OUTSTANDING GRANT PER SLOT.** A caller MUST NOT
+    ## publish a second grant into a slot until the waiter has consumed the first
+    ## (observed the bumped value AND read the payload). This is a real contract,
+    ## not a style note, and it is not enforced here.
+    ##
+    ## WHY IT CANNOT BE RELAXED. `payload` is ONE word and `value` is a plain
+    ## counter; nothing couples them. A second `publishGrant` overwrites the first
+    ## payload in place while bumping `value` a second time, so a waiter that was
+    ## already awake against the FIRST bump can read the SECOND payload and
+    ## acknowledge the FIRST value: one grant is delivered twice and one is never
+    ## delivered at all. The release/acquire pairing above does not help — it makes
+    ## the payload that accompanies a bump visible, and says nothing about which
+    ## bump the reader is answering. MV1's TLA+ model demonstrates it:
+    ## `verification/tla/shm_lease_wait_overwrite_MC.cfg` is required to violate
+    ## `GrantPayloadCoherent`, and does.
+    ##
+    ## THE PRECONDITION IS ALREADY VIOLATED IN-TREE, and saying so is the point of
+    ## writing it down. `tests/test_shm_lease_wait_multiprocess.nim` publishes into
+    ## `ProgressSlot` once per park, unconditionally, with no consumption handshake.
+    ## That call site is SAFE — but for reasons that are properties of the CONSUMER,
+    ## not of this procedure: `awaitProgress` polls `slotPayload` for a MONOTONE
+    ## LEVEL (`>= atLeast`) rather than reading per-grant messages, so overwriting an
+    ## unread value loses nothing, and nothing ever waits on that slot's wait word,
+    ## so there is no wake to lose either. Every one of those is a property of one
+    ## test's helper, invisible from here, and unenforced. That is a weaker
+    ## foundation than a stated contract: it holds only as long as nobody reuses the
+    ## slot for a message, and there is nothing in the code to tell them not to.
+    ##
+    ## M5 IS WHERE THIS BECOMES LOAD-BEARING. Its gate promises "no double grant",
+    ## and the flat-combining arbiter is precisely a caller that grants repeatedly
+    ## into per-waiter slots. It must either serialise grants per slot behind the
+    ## waiter's acknowledgement, or replace this one-word payload with a structure
+    ## that carries its own sequence number. This docstring is not a substitute for
+    ## that decision; it is the record that the decision is owed.
+    ##
     ## ORDER MATTERS: the payload is stored first, then the wait word is bumped
     ## with a RELEASE store, so a waiter that acquire-loads the changed word is
     ## guaranteed to see the payload that went with it. And the wake comes AFTER
