@@ -316,8 +316,21 @@ couple the payload to the value so a stale pair is detectable.
 
 ### Finding 2 (the `:first_target:` ordering claim — the docstring is wrong)
 
-**`waitOn`'s stated justification for its lost-wakeup freedom does not hold, and
-the model shows the window is not excluded by the protocol.**
+> **RESOLVED 2026-08-18, in a commit separate from this tier.** `wakeAll` and
+> `wakeOne` now execute `fullFence()` — `atomicThreadFence(ATOMIC_SEQ_CST)` —
+> immediately before loading `waiters`, and `waitOn`'s docstring now names that
+> fence as the reason instead of appealing to a sequential consistency it does not
+> have. The waiter side deliberately got **no** fence; its seq-cst RMW already
+> orders that side, and `grant-bump-vs-waiters-WAITER-FENCE-ONLY-control.litmus`
+> shows a waiter-side fence would have fixed nothing. Three new litmus tests pin
+> the shipped fenced pair under C11, x86-TSO and AArch64 (all required
+> **Forbidden**), and the two tests below that report **Allowed** are kept beside
+> them so the Forbidden verdicts are bought by the fence rather than free.
+> The models cannot detect a source regression — that is
+> `tests/check-fence-shape.sh`'s job, wired into `just test`; see the litmus table
+> below. Measured cost on the wake fast path: 2.42 → 2.44
+> ns/op (arm64; `dmb ish`), with SM-2 still at **zero syscalls**. Everything in
+> this section describes the code **as MV1 found it**.
 
 The docstring says: *"Sequential consistency on both accesses gives a single total
 order in which at least one of the two must observe the other."* But the
@@ -394,8 +407,8 @@ so GMP's headers and pkg-config file are real build inputs). It took about
 20 minutes including three failed attempts.
 
 Wired as `just verify-litmus`. **`litmus/run-litmus.sh` CHECKS EVERY VERDICT** and
-fails if any test does not produce the required one — necessary because four of
-these tests are required to be **Allowed**, and a runner that only knew how to
+fails if any test does not produce the required one — necessary because five of
+these sixteen tests are required to be **Allowed**, and a runner that only knew how to
 report "Never" would have silently converted its own controls into passes.
 
 | Test | Model | Required | **RAN** |
@@ -413,6 +426,41 @@ report "Never" would have silently converted its own controls into passes.
 | `grant-bump-vs-waiters-aarch64` | AArch64 | Never | **Never** |
 | `grant-bump-vs-waiters-SEQCST-fix` | C11 | Never | **Never** |
 | `grant-bump-vs-waiters-x86-FENCED` | x86-TSO | Never | **Never** |
+| `grant-bump-vs-waiters-FENCED-fix` † | C11 | Never | **Never** |
+| `grant-bump-vs-waiters-aarch64-FENCED` † | AArch64 | Never | **Never** |
+| `grant-bump-vs-waiters-WAITER-FENCE-ONLY-control` † | C11 | **Sometimes** | **Sometimes** |
+
+† Added 2026-08-18 with the fix for Finding 2. The three `-FENCED*` rows
+(`-FENCED-fix`, `-x86-FENCED`, `-aarch64-FENCED`) pin the pair the source now
+**compiles to**: release store of `value`, `fullFence()` in `wakeAll` / `wakeOne`,
+seq-cst load of `waiters`, waiter unfenced.
+
+**They are NOT a regression barrier over `src/`, and an earlier version of this
+paragraph said they were.** A `.litmus` file is a standalone program: herd7's
+verdict is a deterministic function of that file alone, so *no* edit to the Nim
+source can move it. Deleting `fullFence()` from `waitword.nim` and re-running
+leaves all sixteen verdicts unchanged and `just verify-litmus` green — checked by
+doing exactly that on 2026-08-18. What these rows pin is the **intended shape**,
+and keeping the source in step with the models is a **review obligation** at this
+tier, not an automated one.
+
+The automated one lives in `tests/check-fence-shape.sh`, run by `just
+test-fence-shape` as part of **`just test`** (not `just verify` — see that script's
+header for why). It compiles a driver that calls both `wakeAll` and `wakeOne`,
+disassembles them, and requires a full-fence instruction (`dmb ish` on arm64,
+`mfence` / a `lock`-prefixed op on x86-64) to precede the load of `waiters`, with
+no earlier load of it. It was proven to fail against four mutations: the fence
+deleted from both procs, deleted from `wakeAll` only, **moved to after the load**
+(the relocation a source grep cannot see), and weakened from `ATOMIC_SEQ_CST` to
+`ATOMIC_ACQUIRE`. On an architecture it has no instruction profile for it prints a
+banner and exits non-zero rather than passing.
+
+The `WAITER-FENCE-ONLY` control is what licenses the shipped
+**asymmetry**: obsring fences both sides of its Dekker pair, so the question
+"should `waitOn` get a fence too?" had to be answered rather than assumed, and the
+answer is that a waiter-side fence with an unfenced publisher leaves the lost
+wakeup **reachable** — the waiter's seq-cst RMW already orders its own side, and
+the reordering that loses the wakeup is the publisher's.
 
 ### The controls are the point, and one of them is a lesson
 
@@ -487,11 +535,13 @@ under C11 it is permitted outright. See "Finding 2" below.
 
 Fourteen configurations in total: **6 green** and **8 required to fail**, which is
 the whole set `just verify` runs.
-- `litmus/*.litmus` — 13 herd7 tests across the C11, x86-TSO and AArch64 models:
+- `litmus/*.litmus` — 16 herd7 tests across the C11, x86-TSO and AArch64 models:
   the grant-payload publish pair and its relaxed controls on all three models, the
-  publish-before-write pair, RMW atomicity, and the `:first_target:` store-load
-  pair with two confirmed remedies.
+  publish-before-write pair, RMW atomicity, the `:first_target:` store-load pair
+  (both remedies), and — added with the fix — the three tests that pin the SHIPPED
+  fenced pair on all three models plus the waiter-fence-only control.
+  (13 of these are MV1's own; the last three landed with the Finding 2 fix.)
 - `litmus/run-litmus.sh` — runs them and **checks every verdict**, including the
-  four that must be *Allowed*.
+  five that must be *Allowed*.
 - `litmus/get-herd7.sh` — builds herdtools7 7.58 through opam where nixpkgs has no
   package for it, which is the case on aarch64-darwin.

@@ -59,7 +59,7 @@ build:
 
 # Test: the whole suite. Deterministic — no flaky stress in `test`.
 test: test-unit test-integration test-waitword test-wait-integration \
-      test-obsring test-obs-integration test-hooks
+      test-fence-shape test-obsring test-obs-integration test-hooks
 
 # Unit: packed-budget arithmetic, fixed-claim-order enforcement, boot+pid+start-time
 # anchoring, over-release refusal, and the NEGATIVE controls proving the overcommit
@@ -110,6 +110,30 @@ test-wait-integration:
     mkdir -p test-logs
     nim c -r {{nim-flags}} {{src-paths}} \
         tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee test-logs/test-wait-integration.log
+
+# THE FENCE-SHAPE BARRIER: disassembles `wakeAll` / `wakeOne` and requires a FULL
+# fence instruction (`dmb ish` on arm64, `mfence`/`lock`-prefixed on x86-64) to
+# precede the load of `waiters`, with no earlier load of it.
+#
+# IT LIVES IN `test`, NOT IN `verify`, and the placement is the point. `verify` is
+# deliberately opt-in — TLC and herd7 are not in the dev shell — and the litmus
+# tests it runs CANNOT fail in response to a source change: a `.litmus` file is a
+# standalone model, so herd7's verdict is a function of that file alone. Delete
+# `fullFence()` from `waitword.nim` and all sixteen litmus verdicts still pass.
+# The person who would delete it is optimising `src/` and runs `just test`; this is
+# the tier that has to notice. It needs nothing `test` does not already need — the
+# Nim compiler and the platform's `objdump`.
+#
+# It FAILS rather than degrading to green when it cannot read what it is checking
+# (symbol missing, unfamiliar codegen, unknown architecture); see the script header
+# for the opt-out and for the mutations it was proven against.
+test-fence-shape:
+    #!/usr/bin/env bash
+    # `pipefail` so a FAILING barrier propagates through `| tee` instead of being
+    # reported as success — the same false-green hazard the other recipes guard.
+    set -euo pipefail
+    mkdir -p test-logs
+    tests/check-fence-shape.sh 2>&1 | tee test-logs/test-fence-shape.log
 
 # M4 unit: the observation ring. The segment format and its refusals, position
 # independence across two bases, OS-1 (publishing never blocks, never fails, needs
@@ -246,6 +270,7 @@ lint-nim:
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} tests/fence_shape_driver.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_wait.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/probe_fastpath.nim 2>&1 | tee -a test-logs/lint-nim.log
@@ -336,9 +361,11 @@ verify-tla-negative:
 # settles what TLC structurally cannot — TLC explores sequentially-consistent
 # interleavings and does not model reordering.
 #
-# The runner CHECKS EVERY VERDICT rather than printing output, and four of the
-# thirteen tests are required to be ALLOWED (they are the controls that make the
-# Forbidden verdicts mean something, plus the `:first_target:` finding itself).
+# The runner CHECKS EVERY VERDICT rather than printing output, and five of the
+# sixteen tests are required to be ALLOWED (they are the controls that make the
+# Forbidden verdicts mean something, plus the `:first_target:` defect itself,
+# which is kept as the "before" half of its own regression barrier now that the
+# fix has landed).
 #
 # nixpkgs has NO herdtools7 on aarch64-darwin under any attribute, so
 # `verification/litmus/get-herd7.sh` builds it through opam against the nixpkgs

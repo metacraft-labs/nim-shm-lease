@@ -1,15 +1,28 @@
 X86 grant-bump-vs-waiters-x86-FENCED
 (*
- * THE REMEDY for `grant-bump-vs-waiters-x86.litmus`, and the reason that result
- * is actionable rather than merely alarming: one MFENCE between the value bump
- * and the load of `waiters`.
+ * THE SHIPPED FORM ON x86-TSO. This was written as the proposed remedy for
+ * `grant-bump-vs-waiters-x86.litmus`; it is now what
+ * `src/shm_lease/waitword.nim` actually compiles to. One MFENCE between the value
+ * bump and the load of `waiters`.
+ *
+ * NOT A REGRESSION BARRIER, and an earlier version of this comment called it one.
+ * A `.litmus` file is a standalone model: herd7's verdict is a function of this
+ * file alone, so no edit to `src/` can move it -- deleting `fullFence()` leaves
+ * this Never exactly where it is. The mechanical barrier is
+ * `tests/check-fence-shape.sh` (`just test-fence-shape`), which disassembles the
+ * shipped `wakeAll` / `wakeOne` and requires a full-fence instruction ahead of the
+ * `waiters` load. This file pins the INTENDED shape.
  *
  * In C that is `atomicThreadFence(ATOMIC_SEQ_CST)` after `publishValue` and
  * before `wakeAll` reads the waiter count -- which is EXACTLY the Dekker pairing
  * `src/shm_lease/obsring.nim` already applies to its structurally identical
  * idle-token / `tail - head` pair, "rather than relying on whatever ordering a
- * particular CAS mapping happens to emit on ARM64". The same library already
- * contains the fix; it is just not applied here.
+ * particular CAS mapping happens to emit on ARM64". The fix was adopted from the
+ * pattern the library already contained; `fullFence()` in `wakeAll` / `wakeOne`
+ * is the same three words.
+ *
+ * The C-level companion is `grant-bump-vs-waiters-FENCED-fix.litmus`; the arm64
+ * one is `grant-bump-vs-waiters-aarch64-FENCED.litmus`.
  *
  * (Making the value store SEQ-CST instead would also work -- on x86 that lowers
  * to a LOCKed instruction, which is a full barrier. See

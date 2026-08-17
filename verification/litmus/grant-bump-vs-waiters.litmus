@@ -2,6 +2,18 @@ C grant-bump-vs-waiters
 (*
  * MV1 :first_target: -- THE ONE ORDERING CLAIM THIS TIER EXISTS TO SETTLE.
  *
+ * STATUS: THE DEFECT DESCRIBED BELOW IS FIXED IN THE SOURCE. `wakeAll` /
+ * `wakeOne` now execute `fullFence()` -- `atomicThreadFence(ATOMIC_SEQ_CST)` --
+ * immediately before loading `waiters`. This file is KEPT, and kept required to
+ * be ALLOWED, because it is the CONTROL for the fenced tests: it pins the
+ * UNFENCED shape as permitting the lost wakeup, so the Never verdicts of
+ * `grant-bump-vs-waiters-FENCED-fix` and `-x86-FENCED` are earned rather than
+ * free -- the two pairs differ by one instruction and the verdicts differ with
+ * them. It is NOT a regression barrier over `src/`: no source change can move a
+ * herd7 verdict. That barrier is `tests/check-fence-shape.sh`
+ * (`just test-fence-shape`), which disassembles the shipped procs.
+ * Everything below describes the code AS IT WAS.
+ *
  * `src/shm_lease/waitword.nim`, the publisher's pair:
  *
  *     publishValue(base, off, cur + 1)     # storeU32Release  -> value

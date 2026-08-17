@@ -1,0 +1,65 @@
+C grant-bump-vs-waiters-FENCED-fix
+(*
+ * THE SHIPPED PAIR, AT THE LEVEL THE NIM SOURCE IS WRITTEN AT.
+ * `grant-bump-vs-waiters.litmus` pins the shape that was BROKEN; this pins the
+ * shape that is now COMPILED, and says WHY it is sound on all three models.
+ *
+ * WHAT THIS FILE IS NOT: A REGRESSION BARRIER. A `.litmus` file is a standalone
+ * program. herd7's verdict is a deterministic function of THIS FILE and nothing
+ * else, so no edit to `src/` can move it: delete `fullFence()` from
+ * `src/shm_lease/waitword.nim` and `just verify-litmus` still reports all sixteen
+ * verdicts unchanged (checked by doing exactly that, 2026-08-18). This test pins
+ * the INTENDED shape. Keeping the source in step with it is a REVIEW obligation
+ * here — and a MECHANICAL one in `tests/check-fence-shape.sh` (`just
+ * test-fence-shape`, wired into `just test`), which disassembles `wakeAll` and
+ * `wakeOne` and fails unless a full fence instruction precedes the load of
+ * `waiters`. That check FAILS when the fence is deleted, moved after the load, or
+ * weakened to acquire; this file does not, and never could.
+ *
+ * `src/shm_lease/waitword.nim` as shipped, the publisher (`bumpAndWake` /
+ * `publishGrant` -> `wakeAll`):
+ *
+ *     publishValue(base, off, cur + 1)   # storeU32Release      -> value
+ *     ...
+ *     fullFence()                        # atomicThreadFence(SEQ_CST)   <-- THE FIX
+ *     loadU32SeqCst(base, off + WwOffWaiters)                   <- waiters
+ *
+ * and the waiter, `waitOn`, UNCHANGED:
+ *
+ *     discard addU32SeqCst(base, off + WwOffWaiters, 1)   # RMW seq_cst -> waiters
+ *     if loadU32SeqCst(base, off + WwOffValue) != expected: ...  # load seq_cst <- value
+ *
+ * NOTE WHAT IS ASYMMETRIC HERE, because it is the whole reason this test exists
+ * separately from `grant-bump-vs-waiters-SEQCST-fix.litmus`. The fence is on the
+ * PUBLISHER ONLY. The waiter gets none, because its `atomic_fetch_add` is already
+ * a seq-cst read-modify-write (a `LOCK`ed instruction on x86, `LDADDAL` on ARM64)
+ * and that orders the increment against the following load of the value. This
+ * test is what licenses NOT adding a second fence; the companion control
+ * `grant-bump-vs-waiters-WAITER-FENCE-ONLY-control.litmus` is what shows the
+ * asymmetry runs the way it does and not the other way.
+ *
+ * The fence form was chosen over the seq-cst store (`-SEQCST-fix`) because
+ * `src/shm_lease/obsring.nim` already solves the structurally identical
+ * store-then-check-peer problem with `fullFence()` on both sides of its
+ * idle-token / `tail - head` pair. Both are Forbidden; the fence is the one the
+ * library already contains.
+ *
+ * RESULT (herd7 7.58, 2026-08-18): **FORBIDDEN / "Never 0 3"**.
+ *)
+{
+  value = 0;
+  waiters = 0;
+}
+
+P0 (atomic_int *value, atomic_int *waiters) {
+  atomic_store_explicit(value, 1, memory_order_release);
+  atomic_thread_fence(memory_order_seq_cst);
+  int r0 = atomic_load_explicit(waiters, memory_order_seq_cst);
+}
+
+P1 (atomic_int *value, atomic_int *waiters) {
+  atomic_fetch_add_explicit(waiters, 1, memory_order_seq_cst);
+  int r1 = atomic_load_explicit(value, memory_order_seq_cst);
+}
+
+exists (0:r0 = 0 /\ 1:r1 = 0)

@@ -22,7 +22,10 @@
 ##     return `wrNotEqual` having executed one atomic load and no syscall.
 ##   * **Waker fast path** — `wakeAll` / `wakeOne` read the waiter count in
 ##     userspace first. With no registered waiter there is nobody to wake:
-##     return `wkNoWaiters` having executed one atomic load and no syscall.
+##     return `wkNoWaiters` having executed one seq-cst fence, one atomic load and
+##     NO syscall. The fence is what makes skipping the syscall sound rather than
+##     merely cheap — see `waitOn`'s docstring — and it is not a syscall, so SM-2
+##     is unaffected by it.
 ##
 ## Both are MEASURED, not asserted: `tests/test_shm_lease_waitword.nim` reads a
 ## kernel-maintained syscall counter (`shm_lease/syscount`) across a large batch of
@@ -340,6 +343,17 @@ static int shmLeaseWwWake(void *addr, int all, int shared, int *errOut) {
   proc storeU32Relaxed(base: ShmBase; off: int; v: uint32) {.inline.} =
     atomicStoreN(atField(base, off, uint32), v, ATOMIC_RELAXED)
 
+  proc fullFence() {.inline.} =
+    ## The seq-cst fence of the store-buffering (Dekker) pair between a publisher's
+    ## value bump and the waker's read of the waiter count. Deliberately spelled the
+    ## same way as `src/shm_lease/obsring.nim`'s `fullFence`, which solves the
+    ## structurally identical problem for its idle-token / `tail - head` pair: this
+    ## module is adopting a pattern the library already contains, not inventing one.
+    ##
+    ## NOT exported, because `obsring` defines its own no-argument `fullFence` and
+    ## two exported ones would be an ambiguous identifier at every import site.
+    atomicThreadFence(ATOMIC_SEQ_CST)
+
   # --- the primitive ---------------------------------------------------------
 
   proc waitWordValue*(base: ShmBase; off: int): uint32 {.inline.} =
@@ -436,15 +450,37 @@ static int shmLeaseWwWake(void *addr, int all, int shared, int *errOut) {
     ## `slpBeforeWaitPark` seam — publishing with NO wake syscall at all and
     ## requiring the waiter to come back anyway.
     ##
-    ## What the SEQ-CST pairing does close is the WAKER's fast path. The waker
-    ## stores the value and then loads `waiters`; the waiter increments `waiters`
-    ## and then parks against the old value. If the waker's load could see a stale
-    ## zero while the waiter's park had already committed against the stale value,
-    ## the waiter would sleep with nobody obliged to wake it. Sequential consistency
-    ## on both accesses gives a single total order in which at least one of the two
-    ## must observe the other, so either the waker wakes or the waiter's park finds
-    ## the new value. This is why the two words are seq-cst rather than
-    ## acquire/release.
+    ## What the WAKER's fast path needs is a different guarantee, and it is worth
+    ## being exact about where it comes from — an earlier version of this docstring
+    ## was not, and the imprecision was a real defect rather than a wording nit.
+    ##
+    ## The shape is store-buffering (SB). The waker stores the value and then loads
+    ## `waiters`; the waiter increments `waiters` and then reads the value. The bad
+    ## outcome is BOTH sides missing the other: the waker reads `waiters == 0` and
+    ## skips the wake syscall while the waiter reads the OLD value and parks — and
+    ## nothing recovers it, because the kernel's compare-and-park re-reads that same
+    ## stale value, and no instruction the waiter's core executes can drain another
+    ## core's store buffer.
+    ##
+    ## THE ORDERING IS PROVIDED BY AN EXPLICIT SEQ-CST FENCE IN `wakeAll` /
+    ## `wakeOne`, immediately before the load of `waiters`. It is NOT provided by
+    ## sequential consistency across the pair: the value store is `ATOMIC_RELEASE`,
+    ## not seq-cst, so there is no single total order containing it, and herd7 finds
+    ## the lost wakeup ALLOWED under C11 and under x86-TSO for the unfenced form
+    ## (`verification/litmus/grant-bump-vs-waiters{,-x86}.litmus`). ARMv8's RCsc
+    ## `STLR`/`LDAR` pair forbade it, which is the only reason the unfenced code
+    ## never misbehaved on the arm64 host it was developed on. The fenced form is
+    ## required Forbidden under all three models
+    ## (`grant-bump-vs-waiters-FENCED-fix`, `-x86-FENCED`, `-aarch64-FENCED`).
+    ##
+    ## THE WAITER SIDE NEEDS NO FENCE, and one is deliberately not added. Its
+    ## `addU32SeqCst` is a seq-cst read-modify-write — a `LOCK`ed instruction on x86
+    ## and `LDADDAL` (or an `LDAXR`/`STLXR` loop) on ARM64 — which already orders the
+    ## increment against the following load of the value. herd7 confirms it: the
+    ## fenced-publisher/unfenced-waiter pair, exactly as shipped, is Forbidden under
+    ## C11, x86-TSO and AArch64. A second fence here would cost the SLOW path an
+    ## instruction to buy nothing, and an unjustified barrier is the next reader's
+    ## invitation to remove the justified one with it.
     ##
     ## SPURIOUS WAKEUPS ARE GUARANTEED by every primitive behind this call, so
     ## `wrWoken` means "look again", never "your grant is ready". Callers MUST
@@ -474,6 +510,15 @@ static int shmLeaseWwWake(void *addr, int all, int shared, int *errOut) {
     ## with nobody parked still costs a full syscall and returns `ENOENT` — which
     ## this wrapper reports as `wkNobodyParked`, distinct from the syscall-free
     ## `wkNoWaiters`.)
+    ##
+    ## THE FENCE IS WHAT MAKES SKIPPING THE SYSCALL SOUND, and it is here rather
+    ## than at the call sites on purpose: the *decision* to skip is taken on the
+    ## next line, so the precondition for that decision — that everything this
+    ## thread published before calling is globally visible before `waiters` is read
+    ## — is enforced where it is relied upon. See `waitOn`'s docstring for the
+    ## store-buffering shape it excludes and `verification/litmus/` for the herd7
+    ## verdicts that pin it.
+    fullFence()
     if loadU32SeqCst(base, off + WwOffWaiters) == 0:
       inc wwFastWakes
       return wkNoWaiters
@@ -483,6 +528,10 @@ static int shmLeaseWwWake(void *addr, int all, int shared, int *errOut) {
     ## Wake at most one waiter. This is the shape M5's grant-then-wake needs: the
     ## arbiter assigns capacity to a specific waiter and wakes only that waiter, so
     ## wakes never exceed grants (SM-3) and no herd forms.
+    ##
+    ## Same fence, same reason as `wakeAll` — and it matters MORE here, because M5
+    ## reaches this path once per grant.
+    fullFence()
     if loadU32SeqCst(base, off + WwOffWaiters) == 0:
       inc wwFastWakes
       return wkNoWaiters
@@ -500,6 +549,11 @@ static int shmLeaseWwWake(void *addr, int all, int shared, int *errOut) {
     ## Publish "something changed" (bump the word) and then wake. The bump is what
     ## makes the waiter's fast path work: a waiter that arrives after the bump
     ## observes a different value and never parks at all.
+    ##
+    ## The release store below and the `waiters` load inside `wakeAll` are the
+    ## store-buffering pair `waitOn`'s docstring describes; the seq-cst fence that
+    ## separates them lives inside `wakeAll`, so it cannot be lost by a caller that
+    ## assembles the same two steps itself.
     let cur = loadU32Relaxed(base, off + WwOffValue)
     publishValue(base, off, cur + 1)
     wakeAll(base, off, scope)

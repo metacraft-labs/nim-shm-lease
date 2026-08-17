@@ -19,6 +19,13 @@ AArch64 grant-bump-vs-waiters-aarch64
  * does not give, and formally broken on the architecture it has never run on.
  * That is the worst state to leave an ordering argument in, because the next
  * person to optimise it will reason from the docstring.
+ *
+ * STATUS: FIXED. `wakeAll` / `wakeOne` now fence before loading `waiters`, and
+ * the docstring states the fence -- not sequential consistency -- as the reason.
+ * This file keeps recording that the UNFENCED form was already Forbidden HERE,
+ * which is the explanation for why seven milestones of testing on this arm64 host
+ * never saw the defect. It is NOT an argument for removing the fence: the shipped
+ * arm64 lowering is pinned by `grant-bump-vs-waiters-aarch64-FENCED.litmus`.
  *)
 {
 0:X0=value; 0:X1=waiters;

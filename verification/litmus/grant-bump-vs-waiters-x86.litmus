@@ -2,6 +2,15 @@ X86 grant-bump-vs-waiters-x86
 (*
  * MV1 :first_target:, ON THE MODEL THAT DECIDES IT.
  *
+ * STATUS: FIXED IN THE SOURCE -- `wakeAll` / `wakeOne` now fence before loading
+ * `waiters`, and `grant-bump-vs-waiters-x86-FENCED.litmus` is what the shipped
+ * code compiles to on this model. This file pins the UNFENCED shape and stays
+ * required ALLOWED, because a Forbidden verdict with no Allowed control beside it
+ * is free. It is NOT a regression barrier over `src/` -- a `.litmus` file is a
+ * standalone model and no source change can move its verdict; that barrier is
+ * `tests/check-fence-shape.sh` (`just test-fence-shape`), which disassembles the
+ * shipped `wakeAll` / `wakeOne`. Everything below describes the code AS IT WAS.
+ *
  * The C11 companion (`grant-bump-vs-waiters.litmus`) asks what the STANDARD
  * permits. This asks what x86-TSO permits, which is the question that was never
  * exercised because this code has only ever run on arm64.

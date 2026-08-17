@@ -5,7 +5,8 @@
 # This is not a "look at the output" script. Every test below has a REQUIRED
 # verdict and the script fails if any test does not produce it, because half of
 # these tests are required to be ALLOWED and a suite that only knows how to
-# report "Never" would silently turn its own controls into passes.
+# report "Never" would silently turn its own controls into passes. Of the sixteen
+# tests below, FIVE are required to be ALLOWED.
 #
 #   Never     = the outcome is forbidden by the model
 #   Sometimes = the outcome is permitted by the model
@@ -36,9 +37,25 @@ expect_never=(
   header-magic-publish-aarch64
   # The RMW atomicity the whole claim design assumes.
   budget-cas-atomicity
-  # THE :first_target: REMEDIES -- what the fix would buy.
-  grant-bump-vs-waiters-SEQCST-fix
+  # THE :first_target: FIX, AS SHIPPED. These three pin the pair that
+  # `src/shm_lease/waitword.nim` is INTENDED to compile to (release store, seq-cst
+  # fence in `wakeAll`, seq-cst load of `waiters`; waiter unfenced), under all
+  # three models.
+  #
+  # THEY ARE NOT A REGRESSION BARRIER OVER `src/`, and an earlier version of this
+  # comment claimed they were. Each `.litmus` file is a standalone model: herd7's
+  # verdict is a function of the file alone, so deleting `fullFence()` from
+  # `waitword.nim` leaves every verdict below unchanged (checked, 2026-08-18).
+  # The barrier that DOES fail on that edit is `tests/check-fence-shape.sh`
+  # (`just test-fence-shape`), which disassembles the shipped `wakeAll` / `wakeOne`
+  # and requires a full fence instruction ahead of the `waiters` load. Keeping
+  # these MODELS in step with the source is a review obligation.
+  grant-bump-vs-waiters-FENCED-fix
   grant-bump-vs-waiters-x86-FENCED
+  grant-bump-vs-waiters-aarch64-FENCED
+  # THE REMEDY NOT TAKEN, kept because "both work" is part of the record.
+  grant-bump-vs-waiters-SEQCST-fix
+  # The UNFENCED waiter-side pair on ARM, which is why the defect never fired here.
   grant-bump-vs-waiters-aarch64
   # The same relaxed message passing that is BUGGY on ARM is invisible on x86.
   grant-payload-publish-x86-RELAXED-control
@@ -48,11 +65,18 @@ expect_sometimes=(
   # Controls: these MUST be allowed, or the "Never" verdicts above came for free.
   grant-payload-publish-RELAXED-control
   grant-payload-publish-aarch64-RELAXED-control
-  # THE :first_target: ITSELF. Allowed is the FINDING, not a failure of this
-  # script -- see ../README.md "Finding 2". The shipped release-store/seq-cst-load
-  # pair does not forbid the lost wakeup under C11 or under x86-TSO.
+  # THE :first_target: FINDING, now FIXED in the source but KEPT here: these two
+  # pin the DEFECTIVE shape (release store, no fence, seq-cst load of `waiters`),
+  # which C11 and x86-TSO both permit to lose a wakeup. They are what stops the
+  # `-FENCED-fix` and `-x86-FENCED` Never verdicts above from being free: the two
+  # pairs differ by one instruction and the verdicts differ with them.
+  # See ../README.md "Finding 2".
   grant-bump-vs-waiters
   grant-bump-vs-waiters-x86
+  # And the fence must be on the PUBLISHER: fencing only the waiter leaves the
+  # lost wakeup reachable. This is what licenses the shipped asymmetry (no fence
+  # in `waitOn`) instead of copying obsring's both-sides pairing by reflex.
+  grant-bump-vs-waiters-WAITER-FENCE-ONLY-control
 )
 
 fail=0

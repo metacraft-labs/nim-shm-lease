@@ -1,0 +1,31 @@
+AArch64 grant-bump-vs-waiters-aarch64-FENCED
+(*
+ * THE SHIPPED PAIR ON THE ARCHITECTURE THIS REPO IS DEVELOPED ON, after the MV1
+ * :first_target: fix. `grant-bump-vs-waiters-aarch64.litmus` shows the UNFENCED
+ * form was already Forbidden here — ARMv8's RCsc `STLR`/`LDAR` pair excluded it —
+ * which is exactly why the defect never showed up in seven milestones of testing
+ * on this host.
+ *
+ * This test exists so that fact does not become an argument for removing the
+ * fence. The fence is carried on arm64 too (the code is one implementation, not a
+ * per-arch pair), so the arm64 lowering must be pinned as well; and pinning it
+ * makes the pair of files say the true thing — that on this arch the fence is
+ * REDUNDANT but not WRONG, while on x86 it is the only thing standing between the
+ * code and a permanently lost wakeup.
+ *
+ * P0, the publisher: STLR (the release store of `value`), DMB ISH (`fullFence()`
+ * in `wakeAll`), LDAR (the seq-cst load of `waiters`).
+ * P1, the waiter, unchanged: LDADDAL then LDAR.
+ *
+ * RESULT (herd7 7.58, 2026-08-18): **FORBIDDEN / "Never 0 3"**.
+ *)
+{
+0:X0=value; 0:X1=waiters;
+1:X0=value; 1:X1=waiters;
+}
+ P0             | P1                 ;
+ MOV W2,#1      | MOV W2,#1          ;
+ STLR W2,[X0]   | LDADDAL W2,W4,[X1] ;
+ DMB ISH        | LDAR W3,[X0]       ;
+ LDAR W3,[X1]   |                    ;
+exists (0:X3=0 /\ 1:X3=0)
