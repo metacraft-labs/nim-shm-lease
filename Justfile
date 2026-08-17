@@ -279,7 +279,7 @@ lint-nim:
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/lint-nim.log
 
 # ===========================================================================
-# MV1 — the FORMAL / weak-memory verification tier (`verification/`).
+# MV1 + MV2 — the FORMAL / weak-memory verification tier (`verification/`).
 # ===========================================================================
 #
 # NOT part of `test`: TLC is not in the dev shell, so these recipes pull it from
@@ -290,8 +290,9 @@ lint-nim:
 # Everything in the tier that is runnable on this host.
 verify: verify-tla verify-tla-negative verify-litmus
 
-# TLA+/TLC over the two shipped protocol models (MV1 gate items (a) and (b)).
-# Every invariant must HOLD and every liveness property must hold.
+# TLA+/TLC over the shipped protocol models — MV1's CLAIM and WAIT (gate items
+# (a) and (b)) and MV2's flat-combining COMBINER, which is modelled BEFORE M5
+# implements it. Every invariant must HOLD and every liveness property must hold.
 verify-tla:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -312,6 +313,32 @@ verify-tla:
     echo "=== (b) WAIT protocol: the same, with a seq-cst fence after the bump ==="
     nix shell nixpkgs#tlaplus --command \
         tlc -workers 4 -config shm_lease_wait_tso_fence_MC.cfg shm_lease_wait_MC.tla
+    echo "=== MV2 COMBINER: role, round, grants, release, STEAL; death at every step ==="
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_combine_MC.cfg shm_lease_combine_MC.tla
+    echo "=== MV2 COMBINER: the FALSE-POSITIVE STEAL -- descheduled, stolen from, resumed ==="
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_combine_stall_MC.cfg shm_lease_combine_MC.tla
+    echo "=== MV2 COMBINER: TWO faults, so the recovering round may itself be abandoned ==="
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_combine_f2_MC.cfg shm_lease_combine_MC.tla
+    echo "=== MV2 COMBINER: SAFETY under an arbitrarily wrong steal detector ==="
+    # `-deadlock` DISABLES deadlock checking. It is correct here and only here:
+    # this configuration deliberately runs the epoch counter to its bound (see
+    # `shm_lease_combine_livelock_MC.cfg`, which is required to fail on exactly
+    # that), so the successor-less states at the bound are the bound talking.
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -deadlock -config shm_lease_combine_live_MC.cfg \
+            shm_lease_combine_MC.tla
+    echo "=== MV2 COMBINER: Finding 4's mutation vs. every NON-GHOST invariant ==="
+    # GREEN ON PURPOSE, and it is what keeps Finding 4 from overstating itself.
+    # `shm_lease_combine_unfenced_MC.cfg` is REQUIRED to violate `NeverBoth` on
+    # these same constants; this run asks whether the half-applied round then
+    # DAMAGES anything, using only invariants stated over real state rather than
+    # over the `eres`/`edisc` ghosts. It does not, and the finding says so.
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_combine_unfenced_damage_MC.cfg \
+            shm_lease_combine_MC.tla
 
 # THE NEGATIVE CONTROLS, and they are what make the green runs above evidence.
 # Each of these MUST report a violation; a recipe that passes here has found a
@@ -352,6 +379,29 @@ verify-tla-negative:
         -config shm_lease_wait_overwrite_MC.cfg shm_lease_wait_MC.tla
     expect_violation "FINDING: store-load reorder on the bump/waiters pair -> LOST WAKEUP" \
         -deadlock -config shm_lease_wait_tso_MC.cfg shm_lease_wait_MC.tla
+    expect_violation "MV2 non-vacuity: acquire+steal+die mid-round+discard+complete-by-other" \
+        -config shm_lease_combine_MC_probe.cfg shm_lease_combine_MC.tla
+    expect_violation "MV2 non-vacuity: stolen from while descheduled, then RESUMED and fenced" \
+        -config shm_lease_combine_resume_probe.cfg shm_lease_combine_MC.tla
+    expect_violation "MV2 non-vacuity: death BETWEEN the payload store and the value bump" \
+        -config shm_lease_combine_pub_probe.cfg shm_lease_combine_MC.tla
+    expect_violation "MV2 mutation: NO steal protocol -> admission WEDGED for every process" \
+        -config shm_lease_combine_nosteal_MC.cfg shm_lease_combine_MC.tla
+    expect_violation "MV2 mutation: published value is a COUNTER BUMP -> DOUBLE GRANT on steal" \
+        -config shm_lease_combine_counter_MC.cfg shm_lease_combine_MC.tla
+    # `NoDoubleGrant`'s witness here is a RE-GRANT OF AN ALREADY-COLLECTED
+    # request, not an overwrite of an unread one -- the overwrite case cannot
+    # violate this invariant and is witnessed by `GrantCoherent`. See Finding 3.
+    expect_violation "MV2 mutation: slot NOT serialised -> ALREADY-COLLECTED request GRANTED AGAIN" \
+        -config shm_lease_combine_noserial_MC.cfg shm_lease_combine_MC.tla
+    expect_violation "MV2 FINDING 6: budget word incrementally decremented -> CAPACITY DESTROYED" \
+        -config shm_lease_combine_budget_MC.cfg shm_lease_combine_MC.tla
+    expect_violation "MV2 FINDING 4: commit resolved in a DIFFERENT word from the role transfer" \
+        -config shm_lease_combine_unfenced_MC.cfg shm_lease_combine_MC.tla
+    expect_violation "MV2 FINDING 5: unsound steal detector -> UNBOUNDED role churn" \
+        -config shm_lease_combine_livelock_MC.cfg shm_lease_combine_MC.tla
+    expect_violation "MV2 mutation: round's fit test blind to its own grants -> OVERCOMMIT" \
+        -config shm_lease_combine_fit_MC.cfg shm_lease_combine_MC.tla
     echo "--- the safety half of the no-enforcement mutation MUST still hold:"
     nix shell nixpkgs#tlaplus --command tlc -workers 4 \
         -config shm_lease_claim_ord_nocheck_safety_MC.cfg shm_lease_claim_ord_MC.tla

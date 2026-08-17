@@ -24,3 +24,19 @@ indent_style = unset
 [*.litmus]
 indent_size = unset
 indent_style = unset
+
+# Nim. Doc comments carry hand-aligned tables and transcribed C ABI
+# declarations whose continuation lines align under an opening paren, so they
+# land on odd columns by design. Let nimpretty and project convention own the
+# column math. This mirrors the workspace-root .editorconfig, whose rule this
+# file's `root = true` would otherwise cut off.
+[*.nim]
+indent_size = unset
+
+# The verification tier's README. Its model and litmus tables are column-aligned
+# by hand so names, state counts and depths read straight in a terminal, and the
+# verdict tables are transcribed from herd7 output. Same reasoning as
+# .prettierignore, which covers the same file for the same reason.
+[verification/README.md]
+indent_size = unset
+indent_style = unset

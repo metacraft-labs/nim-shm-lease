@@ -846,6 +846,34 @@ static int shmLeaseWwWake(void *addr, int all, int shared, int *errOut) {
     ## that carries its own sequence number. This docstring is not a substitute for
     ## that decision; it is the record that the decision is owed.
     ##
+    ## **DECIDED BY MV2 (2026-08-18), AND THE EITHER/OR WAS THE WRONG SHAPE: M5
+    ## NEEDS BOTH.** The two remedies close different failure modes and neither
+    ## covers for the other, and `verification/tla/shm_lease_combine*` has a
+    ## required-to-fail configuration for each. Serialisation answers "may I grant
+    ## into this slot?", and dropping it (`shm_lease_combine_noserial_MC.cfg`)
+    ## damages the slot in TWO distinct ways that are worth keeping apart. The one
+    ## `NoDoubleGrant` witnesses is a RE-GRANT OF AN ALREADY-COLLECTED REQUEST: the
+    ## waiter reads its grant, the next round re-decides the slot and grants it
+    ## again, and one request is answered twice. The other — a second grant landing
+    ## on an UNCOLLECTED first — cannot violate `NoDoubleGrant` at all, since a
+    ## waiter that never read the first collects exactly once; it is witnessed by
+    ## `GrantCoherent`, which fails independently on the same configuration, and by
+    ## `NoDiscardOfCollected` / `GrantedEqualsTaken`. Both cases turn on the payload
+    ## being ONE WORD: no sequence number recovers a word that has been overwritten,
+    ## so a stamp makes the loss *detectable*, not survivable. The sequence number
+    ## answers a question
+    ## serialisation never asks — "did the previous, now-dead publisher already
+    ## publish this?" — which is what a combiner stealing a dead peer's round has to
+    ## decide; without it the stealer republishes and the counter bumps twice, with
+    ## the slot serialised throughout (`shm_lease_combine_counter_MC.cfg`).
+    ##
+    ## **The concrete change M5 needs here** is that the published value should be
+    ## the combine round's sequence rather than `value + 1`: writing the same
+    ## sequence twice does not move the waiter's word, so republication after a
+    ## steal is a no-op instead of a second delivery. The wait slot's `value` is
+    ## already specified as "a grant sequence"; today this procedure makes it a
+    ## bare counter, and that is the gap.
+    ##
     ## ORDER MATTERS: the payload is stored first, then the wait word is bumped
     ## with a RELEASE store, so a waiter that acquire-loads the changed word is
     ## guaranteed to see the payload that went with it. And the wake comes AFTER
