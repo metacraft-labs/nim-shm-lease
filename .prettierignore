@@ -1,0 +1,7 @@
+# The verification tier's README is authored content, not generated markdown.
+# Its tables are column-aligned by hand so that model names, state counts and
+# depths line up when read in a terminal, and its litmus verdict tables are
+# transcribed from herd7 output. Reformatting them destroys that alignment and
+# buries real changes under whitespace churn in a document whose exact content
+# is the record of what was verified.
+verification/README.md
