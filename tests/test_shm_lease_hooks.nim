@@ -86,6 +86,26 @@ suite "schedule-hook coverage at every CAS and publish site":
     discard wakeRaw(ws.base, woff)                   # forced: the wake syscall seam
     ws.detach()
 
+    # --- M4: the observation ring's seams ----------------------------------
+    # The append, the signal decision, the consumer's publication of its idle token
+    # and its decision to sleep. The ring's own ticket CAS and release-store publish
+    # live in `nim-shm-queue` and carry that library's seams; these are the four
+    # this milestone added on top, and each is where a lost wakeup would live.
+    let opath = freshPath("coverage-obs")
+    defer: cleanup(opath)
+    var obs = createObsRing(opath, 8, 32)
+    check obs.available
+    var orec: array[32, byte]
+    check obs.publish(orec) == oprPublished            # publish seams
+    check obs.publishForcedSignal(orec) == oprPublished # the signal seam
+    var obuf: array[32, byte]
+    var on = 0
+    while obs.drainOne(obuf, on) == odrGot: discard
+    # An EMPTY ring, a short timeout: the consumer publishes its idle token and
+    # parks, reaching both consumer seams and returning without a second thread.
+    check obs.awaitRecord(timeoutNs = 5_000_000'i64) == owrTimedOut
+    obs.detach()
+
     setScheduleHook(nil)
     # A seam nothing ever reaches is not a seam.
     for p in SchedulePoint:
@@ -428,3 +448,124 @@ suite "M3 deterministic interleavings: publish vs park":
     check gWaitParks == 0'u64          # <-- never entered the kernel
     check gWaitWallMs < 500
     ws.detach()
+
+# ---------------------------------------------------------------------------
+# M4: the observation ring's signalling window
+# ---------------------------------------------------------------------------
+#
+# The two interleavings the empty-to-non-empty rule stands or falls on. Both are
+# driven through real hooks in the real code — nothing here is a model of the
+# protocol, it IS the protocol, paused.
+
+var gObsPath: string
+var gObsRc: int
+var gObsParks: int
+var gObsWallMs: int
+
+proc obsConsumerHookThread(unused: int) {.thread.} =
+  {.cast(gcsafe).}:
+    var ring = attachObsRing(gObsPath)
+    if not ring.available:
+      gObsRc = -1
+      return
+    setScheduleHook(pauseHook)
+    var parks = 0
+    let t0 = epochTime()
+    let rc = ring.awaitRecord(timeoutNs = 1_000_000_000'i64, parks = addr parks)
+    gObsWallMs = int((epochTime() - t0) * 1000)
+    setScheduleHook(nil)
+    gObsParks = parks
+    gObsRc = ord(rc)
+    ring.detach()
+
+suite "M4 deterministic interleavings: an append vs the consumer's park":
+
+  test "an append landing between the empty check and the idle token is NOT slept through":
+    # THE LOST WAKEUP A NAIVE PRODUCER WOULD HAVE. The consumer has already observed
+    # the ring EMPTY and has not yet published its idle token, so a producer
+    # appending in this window CANNOT signal — it looks at the token and correctly
+    # finds nobody idle. The consumer must therefore catch the record itself, which
+    # is what the re-check AFTER the token publication (and the seq-cst fence that
+    # orders the two) exists for. A design that snapshots `tail - head` before
+    # appending and signals on "was empty" loses exactly this record.
+    let path = freshPath("obs-window")
+    defer: cleanup(path)
+    var ring = createObsRing(path, 16, 32)
+    check ring.available
+    gObsPath = path
+    gObsRc = -2
+    gHookPoint = slpBeforeObsIdlePublish
+    resetBarrier()
+
+    var t: Thread[int]
+    createThread(t, obsConsumerHookThread, 0)
+    check waitArrived(1, 10.0)
+    check not ring.consumerIdle()        # the token is NOT published yet
+    var rec: array[32, byte]
+    rec[0] = 42
+    check ring.publish(rec) == oprPublished
+    check ring.signalCount() == 0'u64    # ...and no signal was possible
+    gRelease.store(1)
+    joinThread(t)
+
+    check gObsRc == ord(owrReady)        # <-- it saw the record anyway
+    check gObsParks == 0                 # <-- without ever entering the kernel
+    check gObsWallMs < 500
+    check ring.signalCount() == 0'u64
+    ring.detach()
+
+  test "an append landing just before the park is caught by the kernel's compare":
+    # The other window: the consumer has published its token, re-checked the ring
+    # AND the wait word, and is about to sleep. The producer's append claims the
+    # token and bumps the value; the park is issued against the OLD value, so the
+    # kernel's atomic compare-and-park returns immediately instead of sleeping.
+    # That is the guard — not the userspace re-check, which is only syscall
+    # avoidance.
+    let path = freshPath("obs-prepark")
+    defer: cleanup(path)
+    var ring = createObsRing(path, 16, 32)
+    check ring.available
+    gObsPath = path
+    gObsRc = -2
+    gHookPoint = slpBeforeObsConsumerPark
+    resetBarrier()
+
+    var t: Thread[int]
+    createThread(t, obsConsumerHookThread, 0)
+    check waitArrived(1, 10.0)
+    check ring.consumerIdle()            # the token IS published, and claimable
+    var rec: array[32, byte]
+    rec[0] = 43
+    check ring.publish(rec) == oprPublished
+    check ring.signalCount() == 1'u64    # the producer claimed the transition
+    check not ring.consumerIdle()        # ...exclusively: the token is consumed
+    gRelease.store(1)
+    joinThread(t)
+
+    check gObsRc == ord(owrReady)
+    check gObsWallMs < 500               # it did NOT sit out the timeout
+    ring.detach()
+
+  test "the same schedule with nothing appended sits out the whole timeout":
+    # The control for both tests above. Without it, "the consumer came back
+    # quickly" could equally mean it never committed to sleeping at all.
+    let path = freshPath("obs-ctl")
+    defer: cleanup(path)
+    var ring = createObsRing(path, 16, 32)
+    check ring.available
+    gObsPath = path
+    gObsRc = -2
+    gHookPoint = slpBeforeObsConsumerPark
+    resetBarrier()
+
+    var t: Thread[int]
+    createThread(t, obsConsumerHookThread, 0)
+    check waitArrived(1, 10.0)
+    gRelease.store(1)                    # released, but nothing was appended
+    joinThread(t)
+
+    check gObsRc == ord(owrTimedOut)
+    check gObsWallMs >= 900
+    check gObsParks == 1                 # it really did sleep, exactly once
+    check ring.signalCount() == 0'u64
+    ring.detach()

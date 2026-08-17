@@ -53,6 +53,24 @@ type
     slpBeforeWakePublish    ## about to release-store the new wait-word value
     slpBeforeWakeSyscall    ## waiters observed non-zero; about to enter the kernel
     slpAfterWakeSyscall     ## the wake syscall returned
+    # --- M4: the observation ring (`shm_lease/obsring`) -----------------------
+    #
+    # The ring's ticket CAS and release-store publish live in `nim-shm-queue`'s
+    # Layer 1 and carry that library's own seams; what M4 adds on top is the
+    # SIGNALLING DECISION and the consumer's decision to sleep, and those are
+    # exactly where a lost wakeup would live. Each gets a named seam so the
+    # publish-versus-park window can be driven deterministically instead of chased
+    # as a flake.
+    slpBeforeObsPublish     ## about to append an observation to the ring
+    slpAfterObsPublish      ## the append returned; about to test the waiter count
+    slpBeforeObsSignal      ## a waiter was observed; about to bump + wake
+    slpBeforeObsIdlePublish ## the consumer has seen the ring EMPTY and is about to
+                            ## publish its idle token. Pausing here is what lets a
+                            ## test land an append in the window a naive
+                            ## "snapshot tail-head" producer would lose
+    slpBeforeObsConsumerPark ## the consumer has registered, re-checked the ring AND
+                            ## the value, and is about to sleep. Pausing here is
+                            ## what lets a test publish into the pre-park window
 
   ScheduleHook* = proc (point: SchedulePoint) {.gcsafe, raises: [].}
 

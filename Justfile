@@ -19,7 +19,13 @@ alias fmt := format
 # threads); `--path:src` is re-stated because `--skipParentCfg` suppresses
 # `config.nims`.
 nim-flags := "--skipParentCfg --skipUserCfg --hints:off --threads:on --warning:BareExcept:off"
-src-paths := "--path:src --path:tests"
+# `--path:../nim-shm-queue/src` is the M4 dependency: the observation ring rides
+# `nim-shm-queue`'s Layer 1 (ticket-CAS append, release-store publish,
+# single-consumer drain, atomic signalled drop counter) rather than growing a
+# second copy of the same MPSC protocol. The sibling checkout is the workspace
+# layout; `shm_lease.nimble` threads the same path when the directory exists, which
+# is the convention `nim-shm-queue` itself already uses for its vendored libs.
+src-paths := "--path:src --path:tests --path:../nim-shm-queue/src"
 
 # --- Default targets ---
 
@@ -41,12 +47,19 @@ build:
     nim c {{nim-flags}} {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_wait_multiprocess \
         tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee -a test-logs/build.log
+    nim c {{nim-flags}} {{src-paths}} -d:release \
+        -o:test-logs/test_shm_lease_obsring \
+        tests/test_shm_lease_obsring.nim 2>&1 | tee -a test-logs/build.log
+    nim c {{nim-flags}} {{src-paths}} -d:release \
+        -o:test-logs/test_shm_lease_obs_multiprocess \
+        tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee -a test-logs/build.log
     nim c {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
         -o:test-logs/test_shm_lease_hooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/build.log
 
 # Test: the whole suite. Deterministic — no flaky stress in `test`.
-test: test-unit test-integration test-waitword test-wait-integration test-hooks
+test: test-unit test-integration test-waitword test-wait-integration \
+      test-obsring test-obs-integration test-hooks
 
 # Unit: packed-budget arithmetic, fixed-claim-order enforcement, boot+pid+start-time
 # anchoring, over-release refusal, and the NEGATIVE controls proving the overcommit
@@ -97,6 +110,35 @@ test-wait-integration:
     mkdir -p test-logs
     nim c -r {{nim-flags}} {{src-paths}} \
         tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee test-logs/test-wait-integration.log
+
+# M4 unit: the observation ring. The segment format and its refusals, position
+# independence across two bases, OS-1 (publishing never blocks, never fails, needs
+# no daemon), OS-2 (drops counted, `windowCompleteness` truthful), the kernel
+# syscall counter RE-CALIBRATED before M4 trusts it, and the signalling rule
+# measured at zero syscalls against a signal-on-every-append control.
+test-obsring:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    nim c -r {{nim-flags}} {{src-paths}} \
+        tests/test_shm_lease_obsring.nim 2>&1 | tee test-logs/test-obsring.log
+
+# M4 integration: THE M4 GATE. Real producer processes at DELIBERATELY DIFFERING
+# virtual bases saturating a small ring while a throttled consumer drains it
+# (delivered + dropped == produced, exactly, with a DERIVED lower bound on the drop
+# count and no torn records); the per-process cost of observing measured against a
+# no-observation control and against two IPC controls that must exceed the same
+# tolerance; a multi-second quiet window costing ZERO consumer wakeups against a
+# POLLING control that burns thousands of syscalls; and a sustained non-empty ring
+# signalled exactly ONCE. Takes ~4s, most of it the deliberate idle window;
+# `SHM_LEASE_OBS_IDLE_SECONDS` overrides it, `SHM_LEASE_OBS_PRODUCERS` /
+# `SHM_LEASE_OBS_ROUNDS` / `SHM_LEASE_OBS_PERTURB_ROUNDS` the load.
+test-obs-integration:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    nim c -r {{nim-flags}} {{src-paths}} \
+        tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee test-logs/test-obs-integration.log
 
 # EXTERNAL syscall counting for SM-2, the `strace`/`dtruss` half of the milestone's
 # wording. The suite's own SM-2 assertions use the kernel's per-task counter, which
@@ -202,8 +244,12 @@ lint-nim:
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_waitword.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_wait.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} benchmarks/bench_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/probe_fastpath.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} benchmarks/probe_obs_contention.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/lint-nim.log
 
@@ -226,6 +272,10 @@ bench:
         -o:test-logs/bench_claim benchmarks/bench_claim.nim
     nim c -r {{nim-flags}} {{src-paths}} -d:release \
         -o:test-logs/bench_wait benchmarks/bench_wait.nim
+    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+        -o:test-logs/bench_obsring benchmarks/bench_obsring.nim
+    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+        -o:test-logs/probe_obs_contention benchmarks/probe_obs_contention.nim
 
 # Single-source-of-truth version bump (version.txt is read by shm_lease.nimble).
 bump-version version:

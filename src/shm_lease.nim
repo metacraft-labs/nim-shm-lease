@@ -29,6 +29,14 @@
 ## first-come-if-it-fits is an acceptable admission policy; it is the substrate the
 ## policy is built on.
 ##
+## **M4 has since landed too**: `shm_lease/obsring` is the OBSERVATION RING — a
+## bounded MPSC channel carrying execution observations to the daemon, riding
+## `nim-shm-queue`'s Layer 1 in a THIRD, independent segment. Its producer never
+## blocks and never fails an execution, its drops are counted and surfaced, and its
+## consumer parks on M3's wait word rather than polling. Again a separate segment
+## and a separate format version, for the same reason: a ring-format change must not
+## be able to destabilise admission.
+##
 ## **M3 has since landed alongside it**: `shm_lease/waitword` is the futex-class
 ## cross-process blocking wrapper (SM-1, SM-2), re-exported from this module. It is
 ## a SEPARATE segment with its own format, deliberately — the budget segment's
@@ -92,10 +100,11 @@
 ## **enforced, not merely documented**: `claimWords` REFUSES a non-ascending index
 ## list with `csOutOfOrder`, and there is a test for it.
 
-import ./shm_lease/[hooks, packed, anchor, waitword, syscount]
+import ./shm_lease/[hooks, packed, anchor, waitword, syscount, obsring]
 export packed
 export waitword
 export syscount
+export obsring
 export hooks.SchedulePoint, hooks.scheduleHooksEnabled
 export anchor.AnchorVerdict, anchor.bootId, anchor.processStartTime,
   anchor.pidAlive, anchor.anchorVerdict, anchor.ownerAliveAnchor

@@ -5,23 +5,27 @@ CPU slots, coarse memory units, process count and IO weight packed into **one
 64-bit word**, claimed and released with a single CAS.
 
 Sibling to [`nim-shm-queue`](../nim-shm-queue) (MPSC ring) and
-[`nim-shm-gset`](../nim-shm-gset) (grow-only set). This is the POC library of the
+[`nim-shm-gset`](../nim-shm-gset) (grow-only set) — and, since M4, a **consumer** of
+`nim-shm-queue`: the observation ring rides its Layer 1 rather than growing a second
+copy of the same MPSC protocol, so the sibling checkout must be present to build
+`shm_lease/obsring` (`config.nims`, the `Justfile` and the nimble task each thread
+`--path:../nim-shm-queue/src` when the directory exists). This is the POC library of the
 *RunQuota Observation Store & Shared-Memory Transport* campaign —
 `reprobuild-specs/RunQuota-Observation-Store.milestones.org`, phase 1 — and its
 design authority is
 `reprobuild-specs/RunQuota-Shared-Memory-Transport.md`.
 
-## Status: M2 + M3
+## Status: M2 + M3 + M4
 
 M2 is the spec's *"§1 the fit check and claim are the easy part"*; M3 is
-*"Waiting Without Spinning"*. Nothing beyond those two. Read the scope honestly
-before building on it:
+*"Waiting Without Spinning"*; M4 is *"The Observation Ring"*. Nothing beyond those
+three. Read the scope honestly before building on it:
 
 | Campaign milestone | What it adds | Here? |
 |---|---|---|
 | **M2** | packed-budget multi-dimensional reservation, no overcommit, position independence | **yes** |
 | **M3** | futex-class cross-process blocking (`futex` / `os_sync_wait_on_address`), per-waiter wait slots | **yes** |
-| M4 | observation ring (built on `nim-shm-queue`) | no |
+| **M4** | observation ring: bounded MPSC, counted drops, non-polling consumer (rides `nim-shm-queue`'s Layer 1) | **yes** |
 | M5 | flat-combining arbiter, per-waiter grant slots, grant-then-wake | no |
 | M6 | anti-starvation (bounded wait for large claims) | no |
 | M7 | kill injection, steal protocol, reservation reclamation | no |
@@ -133,6 +137,43 @@ prefaults, and `tests/test_shm_lease_waitword.nim` exhibits both halves on two
 separate fresh mappings — one untouched (`EFAULT`), one whose only access is the
 prefault (blocks and times out cleanly). Reproduced on Darwin 25.5 / arm64.
 
+### The observation ring (M4)
+
+A **third**, independent segment (format version 1), so a ring-format change cannot
+destabilise admission. It rides [`nim-shm-queue`](../nim-shm-queue)'s Layer 1
+through its `EmbeddedRing` view — ticket-CAS append, release-store publish,
+single-consumer drain, atomic **signalled** drop counter — rather than growing a
+second copy of the MPSC protocol, and adds the segment, the consumer wait word and
+the completeness accounting on top.
+
+| Platform | Status | Note |
+|---|---|---|
+| Linux (x86-64, aarch64) | supported | inherits `shm_queue`'s POSIX arm and M3's `futex` wake path. **UNEXERCISED: never run on Linux.** |
+| macOS 14.4+ (arm64, x86-64) | supported, and the only platform it has been RUN on | the consumer parks with `os_sync_wait_on_address`; below 14.4 `awaitRecord` reports `owrUnavailable` and a caller degrades |
+| Windows | **not supported** — no-op arm | `createObsRing` returns unavailable; `publish` returns `oprUnavailable`. Recorded, not omitted. |
+
+The rules it enforces, each measured rather than asserted:
+
+- **Publishing never blocks, never fsyncs, never fails an execution.** A full ring
+  DROPS and bumps the counter; the block-on-full policy the substrate offers is
+  deliberately not used, because blocking a monitored process to preserve an
+  advisory record inverts the priority the component exists to enforce.
+- **Publishing adds no round trip.** No reply, no acknowledgement, no handle.
+- **Drops are counted and SURFACED.** `windowCompleteness` turns the counter into a
+  verdict, so a truncated window can never be recorded as complete.
+- **The consumer never polls.** `awaitRecord` parks on the wait word; a quiet ring
+  costs zero wakeups.
+- **Producers signal only on the empty-to-non-empty transition** — and exactly ONE
+  producer per transition, because the consumer publishes an *idle token* before it
+  sleeps and a producer must CAS that token from 1 to 0 to be the signaller. A
+  producer's own `tail - head` snapshot would be a lost wakeup: the consumer can
+  drain and park in the window between the snapshot and the append.
+
+**The ring is usable with no daemon attached.** `publish` never consults consumer
+liveness — that would put a `kill(2)` probe on the hot path — so with nobody
+draining a client simply fills the ring and then drops, every drop counted. A
+client that wants the standalone fallback asks `consumerVerdict` out of band.
+
 **Page size is a host property, and it bit us.** `MAP_FIXED` needs a page-aligned
 address; pages are 4 KiB on x86-64 Linux and Intel macOS but **16 KiB on Apple
 Silicon**. Striding the position-independence probe bases by the segment size
@@ -183,14 +224,38 @@ if c.awaitGrant(mySlot, seen) == wrNotEqual:
 
 # WAKER: assign first, then wake — never wake-then-retry.
 discard w.publishGrant(mySlot, grantValue)
+
+# --- M4: the observation ring -------------------------------------------------
+
+# DAEMON: create the ring, register, then drain WITHOUT polling.
+var ring = createObsRing("/tmp/runquota.obs", capacity = 4096, maxRecordLen = 256)
+ring.registerConsumer()
+var buf: array[256, byte]
+var n = 0
+while running:
+  if ring.awaitRecord(timeoutNs = 1_000_000_000) == owrReady:   # parks; no polling
+    while ring.drainOne(buf, n) == odrGot:
+      handle(buf, n)
+
+# CLIENT: one append, no reply, no way to fail the execution being observed.
+var client = attachObsRing("/tmp/runquota.obs")
+let before = client.droppedCount()
+case client.publish(record)          # never blocks, never fsyncs
+of oprPublished: discard
+of oprDropped:   discard             # counted, and surfaced below
+of oprOversize, oprUnavailable: discard
+
+# ...and the window can never be presented as complete if it lost anything.
+if client.windowCompleteness(before) == ccTruncated:
+  markCaptureIncomplete()
 ```
 
 ## Test & benchmark
 
 ```bash
-just test           # unit + the M2 and M3 gates + deterministic interleavings
-just bench          # POC-local claim/release and wait/wake cost (M1/M8 own the
-                    # socket comparison)
+just test           # unit + the M2, M3 and M4 gates + deterministic interleavings
+just bench          # POC-local claim/release, wait/wake and per-observation cost
+                    # (M1/M8 own the real socket comparison)
 just soak 20        # the M2 gate harness, 20x the rounds per child
 just test-syscalls  # EXTERNAL syscall counting for SM-2 (strace / dtruss)
 just lint           # nim check over the library and every test
@@ -333,5 +398,96 @@ POC-local, Darwin 25.5 / arm64, one release run — read the variance warning in
 The middle two rows are the point: skipping the wake syscall when the word records
 no waiter is ~177x cheaper than issuing it, and that is the case a naive
 implementation gets wrong on *every* release.
+
+### What the M4 gate proves
+
+`tests/test_shm_lease_obs_multiprocess.nim` forks real producer and consumer
+processes at **deliberately differing virtual bases** and asserts, in five phases:
+
+1. **Saturation** — 4 producers hammer a 256-slot ring while the parent drains it,
+   THROTTLED. `delivered + dropped == produced` holds exactly, no record is torn,
+   each producer's records arrive in order, and the drop count has a **derived lower
+   bound** (`produced - capacity - drained`) so "drops happened" is arithmetic
+   rather than luck. Overlap is structural — M2's start barrier plus stop gate — and
+   is asserted BEFORE the drop assertions, so a regression names the cause.
+2. **OS-1, the perturbation measurement** — each child times the same synthetic work
+   with no observation, with a ring append, with an append into a SATURATED ring
+   (the drop path), with a one-way `write(2)` per observation, and with a socket
+   ROUND TRIP per observation. All within one process, in CPU time, with the
+   baseline re-measured inside every repetition and each arm estimated as the MEDIAN
+   of the paired per-repetition differences over 210 repetitions.
+
+   The bound is **bounded and small, not "indistinguishable"** — observing is
+   reproducibly measurable, and a bar demanding indistinguishability is both
+   unachievable and an invitation to a meaningless tolerance. The threshold is
+   anchored to a noise floor the phase MEASURES on every run: a sixth `paNull` arm
+   runs the baseline loop with nothing added, through the identical estimator, and
+   whatever it reports is the finest difference the instrument can resolve. Two
+   things must then hold before any arm is judged — the floor is small, and **no arm
+   reads meaningfully faster than the baseline**, which is physically impossible
+   since every arm is the baseline plus an observation. The ring arms must stay under
+   the tolerance and **both IPC arms must exceed it**; a tolerance only one side can
+   fail is not a measurement.
+
+   The estimator is PAIRED: the overhead is computed inside each repetition against
+   the baseline measured a few hundred microseconds away, and the result is the
+   MEDIAN of the paired differences over 210 repetitions. The two properties that
+   make the phase survive a loaded host are this paired median and the SHORT
+   MEASUREMENT LOOPS (200 rounds x 210 repetitions rather than 10000 x 2) — and which
+   two was settled by REVERTING each candidate individually: reverting to few long
+   loops fails 12 of 12 runs at 4x oversubscription, and reverting to best-over-phase
+   against best-over-phase fails 5 of 8 runs even idle. The measurement-order rotation and the CPU-time clock are kept but are
+   NOT load-bearing — reverting either still passes 8/8 at 8x oversubscription.
+
+   Measured idle and under 2x and 4x CPU oversubscription (32 and 64 spinners on 16
+   cores), on release AND on the unoptimised build `just test` uses. Floor: exactly
+   0 per mille in all 156 samples. Ring: 3..5 per mille release, 14..17 debug;
+   saturated/drop path 0..1 and 4..5. One-way `write(2)`: 161..235. Socket round
+   trip: 357..376. Against a 50 per mille (5.0%) tolerance — ~2.9x above the worst
+   ring reading over both builds and ~3.2x below the weakest falsifying control.
+   12/12 release gate runs passed at each of the three load levels, and 8/8 debug
+   runs idle and at 4x.
+3. **The idle gate** — a consumer blocks on a quiet ring for a multi-second window
+   and must come back having entered the kernel exactly ONCE (zero wakeups) and
+   burned no measurable CPU, while a POLLING control on the same ring burns
+   thousands of syscalls and must exceed the same limits.
+4. **The signalling gate** — with a consumer parked and a burst that keeps the ring
+   non-empty throughout, the producer's own KERNEL syscall count over the burst must
+   be exactly 1, against a `publishForcedSignal` control that pays one per append.
+5. **No daemon attached** — a child publishes into a ring nobody registered against
+   or drains: no failure, no block, every record accepted or counted.
+
+Proves **OS-1**, **OS-2**, **SM-1 (consumer side)** and **SM-2**. Not proven here:
+OS-3..OS-8 (the store, not the transport), SM-3/SM-4/SM-6, and anything about
+producer death mid-publish — kill injection is M7.
+
+### Per-observation cost (M4)
+
+POC-local, Darwin 25.5 / arm64, ranges across several release runs — read the
+variance warning in `benchmarks/bench_obsring.nim` before quoting any of it:
+
+| operation | cost | syscalls |
+|---|---|---|
+| append, ring has room (one producer) | ~14-34 ns | **0** |
+| append, ring FULL — the counted-drop path | ~4-11 ns | **0** |
+| append that SIGNALS (the transition) | ~443-892 ns | 1 |
+| drain, consumer side | ~10-16 ns | **0** |
+| one-way `write(2)` of the same record | ~383-402 ns | 1 |
+| socket round trip (send + ack) | ~850-915 ns | 4 |
+
+The third row against the first is the whole argument for signalling only on the
+empty-to-non-empty transition: a transition costs ~26-31x a plain append, so a
+design that signalled on every append would pay it every time.
+
+**Known cost, measured and not hidden:** with several processes appending to ONE
+ring as fast as they can, the ticket-CAS cache line becomes the bottleneck and the
+per-append cost rises from ~26-32 ns (one producer) to ~190-255 ns (three) and
+~800-955 ns (six) — `benchmarks/probe_obs_contention.nim`, run by `just bench`, eight
+invocations on this host. Read the variance warning literally: in the two invocations
+taken while the host was busy the SINGLE-producer arm alone read 125-194 ns, so the
+contention ratios are only meaningful between arms measured in the same invocation. That rate is far beyond anything an execution stream can
+generate — one observation per *execution*, not per microsecond — so it bounds the
+substrate rather than the design, and reducing it is what M5's flat combining is
+for. The M4 gate reports it and deliberately does not assert on it.
 
 Apache-2.0.
