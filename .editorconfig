@@ -1,0 +1,26 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# TLA+ models. Indentation is SEMANTICALLY SIGNIFICANT in TLA+: an aligned
+# conjunction or disjunction list (/\ or \/ at a fixed column) is a single
+# expression whose extent is defined by that column, so re-indenting a model
+# changes what it means — or stops it parsing. Leave it to the author.
+#
+# Same reasoning, and the same remedy, as the `[*.rs] indent_size = unset`
+# entry in the workspace-root .editorconfig.
+[*.tla]
+indent_size = unset
+indent_style = unset
+
+# herdtools litmus tests. The instruction blocks are column-aligned per thread
+# and herd7 parses that layout.
+[*.litmus]
+indent_size = unset
+indent_style = unset
