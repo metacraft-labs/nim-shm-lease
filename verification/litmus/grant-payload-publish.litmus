@@ -1,0 +1,38 @@
+C grant-payload-publish
+(*
+ * THE GRANT-THEN-WAKE MESSAGE PASSING (MP) SHAPE.
+ *
+ * `publishGrant` (src/shm_lease/waitword.nim): the payload is stored, THEN the
+ * wait word is bumped with a RELEASE store. `awaitGrant`/`awaitValueChange`
+ * ACQUIRE-load the word and only then read the payload.
+ *
+ *     storeU64Relaxed(payload, grant)          |  loadU32Acquire(value)
+ *     storeU32Release(value, cur + 1)          |  loadU64Acquire(payload)
+ *
+ * The spec's claim (SS"Grant-then-wake ordering"): "A waiter that observes the new
+ * `value` with an acquire load has, by that release, necessarily observed the
+ * payload written before it. So a waiter WAKES ALREADY HOLDING ITS GRANT."
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **FORBIDDEN / "Never 0 3"**, and the
+ * `-RELAXED-control` companion is ALLOWED -- so the verdict here is bought by the
+ * release/acquire pair rather than coming for free. The hardware form is
+ * `grant-payload-publish-aarch64.litmus` (also FORBIDDEN), and its relaxed
+ * control is ALLOWED on ARMv8 while FORBIDDEN on x86-TSO: the "passes on x86,
+ * faults on ARM64" trap, as two verdicts instead of a warning.
+ *)
+{
+  value = 0;
+  payload = 0;
+}
+
+P0 (atomic_int *value, atomic_int *payload) {
+  atomic_store_explicit(payload, 42, memory_order_relaxed);
+  atomic_store_explicit(value, 1, memory_order_release);
+}
+
+P1 (atomic_int *value, atomic_int *payload) {
+  int r0 = atomic_load_explicit(value, memory_order_acquire);
+  int r1 = atomic_load_explicit(payload, memory_order_acquire);
+}
+
+exists (1:r0 = 1 /\ 1:r1 = 0)

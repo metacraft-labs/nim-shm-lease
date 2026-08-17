@@ -1,0 +1,26 @@
+AArch64 header-magic-publish-aarch64
+(*
+ * PUBLISH-BEFORE-WRITE on the hardware model. Same shape as
+ * `grant-payload-publish-aarch64.litmus` but on the pair every segment in this
+ * campaign depends on: a geometry field written first, then `magic` with a
+ * RELEASE store; an attacher ACQUIRE-loads `magic` and only then reads the
+ * geometry (`RunQuota-Shared-Memory-Structures.md` SS"Conventions Every Segment
+ * Obeys").
+ *
+ * It is run separately rather than inferred from the payload pair because it is
+ * the ordering three separate segment formats (lease, wait, ring) all rest on,
+ * and because "structurally identical" is the kind of claim that is true until a
+ * layout changes.
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **FORBIDDEN / "Never"**.
+ *)
+{
+0:X0=magic; 0:X1=budgetsOff;
+1:X0=magic; 1:X1=budgetsOff;
+}
+ P0             | P1            ;
+ MOV W2,#128    | LDAR W2,[X0]  ;
+ STR W2,[X1]    | LDR W3,[X1]   ;
+ MOV W3,#1      |               ;
+ STLR W3,[X0]   |               ;
+exists (1:X2=1 /\ 1:X3=0)

@@ -1,0 +1,27 @@
+AArch64 grant-payload-publish-aarch64-RELAXED-control
+(*
+ * THE CONTROL THAT GIVES THIS WHOLE TIER ITS REASON TO EXIST.
+ *
+ * Identical to `grant-payload-publish-aarch64.litmus` with the release/acquire
+ * pair DOWNGRADED to plain STR/LDR -- i.e. the same protocol written by someone
+ * who thought the memory orders were decoration.
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **ALLOWED / "Sometimes"** on ARMv8.
+ *
+ * Read it against `grant-payload-publish-x86-RELAXED-control.litmus`, which is
+ * the SAME relaxed code and is **FORBIDDEN** on x86-TSO. That pair is the
+ * "passes on x86 for months, faults on ARM64 under a rare schedule" trap, stated
+ * as two herd7 verdicts instead of as a warning: relaxing these orders is
+ * UNDETECTABLE by any amount of x86 testing and unsound on the architecture this
+ * library actually ships on.
+ *)
+{
+0:X0=value; 0:X1=payload;
+1:X0=value; 1:X1=payload;
+}
+ P0             | P1            ;
+ MOV W2,#42     | LDR W2,[X0]   ;
+ STR W2,[X1]    | LDR W3,[X1]   ;
+ MOV W3,#1      |               ;
+ STR W3,[X0]    |               ;
+exists (1:X2=1 /\ 1:X3=0)

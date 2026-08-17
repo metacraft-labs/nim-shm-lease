@@ -259,6 +259,7 @@ just bench          # POC-local claim/release, wait/wake and per-observation cos
 just soak 20        # the M2 gate harness, 20x the rounds per child
 just test-syscalls  # EXTERNAL syscall counting for SM-2 (strace / dtruss)
 just lint           # nim check over the library and every test
+just verify         # the FORMAL tier: TLA+/TLC models + herd7 litmus tests
 ```
 
 `just test-syscalls` is **not** part of `test`: on macOS `dtrace`/`dtruss` need
@@ -280,6 +281,29 @@ arm64, not diagnosed, and not claimed as passing anywhere — run it on x86-64 L
 Note also that TSAN/DRD shadow state by *virtual address* while every process maps
 the segment at its own base, so they structurally cannot observe the cross-mapping
 ordering; that is what the multi-process gate covers.
+
+### The formal tier — `just verify`
+
+`verification/` holds what the dynamic suite structurally cannot reach. The suite
+above **samples** the schedule space; a lock-free budget word whose correctness
+rests on a per-field fit test, and a wait protocol whose lost-wakeup freedom rests
+on a release/acquire pairing, are not amenable to exhaustive dynamic testing on one
+architecture.
+
+```bash
+just verify           # everything below
+just verify-tla       # TLA+/TLC: the CLAIM and WAIT protocols, all invariants
+just verify-tla-negative   # the mutations and non-vacuity probes, which MUST fail
+just verify-litmus    # herd7 under the C11, x86-TSO and AArch64 memory models
+```
+
+`verification/README.md` is the record: state counts and depths for every model,
+what each invariant establishes, the coverage boundaries, and **two findings** —
+`publishGrant` has an unstated one-outstanding-grant-per-slot precondition whose
+violation silently loses a grant, and `waitOn`'s docstring justifies its
+lost-wakeup freedom with an argument that does not hold, for a window herd7 reports
+as **Allowed on x86-TSO** and **Forbidden on ARMv8**. Read it before changing any
+memory order in `waitword.nim`.
 
 ### What the gate proves
 

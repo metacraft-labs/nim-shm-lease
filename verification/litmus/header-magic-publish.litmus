@@ -1,0 +1,32 @@
+C header-magic-publish
+(*
+ * PUBLISH-BEFORE-WRITE, the convention EVERY segment in this campaign obeys
+ * (`RunQuota-Shared-Memory-Structures.md` SS"Conventions Every Segment Obeys"):
+ * "the magic word is written LAST, with release ordering. A reader that observes
+ * the magic has, by that release, observed every field written before it."
+ *
+ * Modelled on the lease segment: `budgetsOff` (a geometry field an attacher uses
+ * to compute where the budget records are) is written first, then `magic` with a
+ * release store. `attach` acquire-loads `magic` and only then reads the geometry.
+ * A reader that saw the magic but a ZERO geometry would compute a nonsense
+ * mapping -- this is the ordering pair the format-version and magic checks assume.
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **FORBIDDEN / "Never 0 3"**. The hardware form
+ * is `header-magic-publish-aarch64.litmus`, also FORBIDDEN.
+ *)
+{
+  magic = 0;
+  budgetsOff = 0;
+}
+
+P0 (atomic_int *magic, atomic_int *budgetsOff) {
+  atomic_store_explicit(budgetsOff, 128, memory_order_relaxed);
+  atomic_store_explicit(magic, 1, memory_order_release);
+}
+
+P1 (atomic_int *magic, atomic_int *budgetsOff) {
+  int r0 = atomic_load_explicit(magic, memory_order_acquire);
+  int r1 = atomic_load_explicit(budgetsOff, memory_order_relaxed);
+}
+
+exists (1:r0 = 1 /\ 1:r1 = 0)

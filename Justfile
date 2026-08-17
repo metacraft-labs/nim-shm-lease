@@ -253,6 +253,110 @@ lint-nim:
     nim check {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/lint-nim.log
 
+# ===========================================================================
+# MV1 — the FORMAL / weak-memory verification tier (`verification/`).
+# ===========================================================================
+#
+# NOT part of `test`: TLC is not in the dev shell, so these recipes pull it from
+# nixpkgs on demand and are deliberately opt-in. `verification/README.md` records
+# what ran, with state counts and depths, and — the half that matters more — the
+# COVERAGE BOUNDARIES of what ran.
+
+# Everything in the tier that is runnable on this host.
+verify: verify-tla verify-tla-negative verify-litmus
+
+# TLA+/TLC over the two shipped protocol models (MV1 gate items (a) and (b)).
+# Every invariant must HOLD and every liveness property must hold.
+verify-tla:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd verification/tla
+    echo "=== (a) CLAIM protocol: ascending multi-word claim, rollback, release ==="
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_claim_MC.cfg shm_lease_claim_MC.tla
+    echo "=== (a) CLAIM protocol: the ENFORCED claim order excludes the cycle ==="
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_claim_ord_MC.cfg shm_lease_claim_ord_MC.tla
+    echo "=== (a) CLAIM protocol: the per-field fit test, on the borrow workload ==="
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_claim_borrow_fit_MC.cfg \
+            shm_lease_claim_borrow_MC.tla
+    echo "=== (b) WAIT protocol: grant-then-wake, park, re-validate ==="
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_wait_MC.cfg shm_lease_wait_MC.tla
+    echo "=== (b) WAIT protocol: the same, with a seq-cst fence after the bump ==="
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_wait_tso_fence_MC.cfg shm_lease_wait_MC.tla
+
+# THE NEGATIVE CONTROLS, and they are what make the green runs above evidence.
+# Each of these MUST report a violation; a recipe that passes here has found a
+# model that cannot fail, which is worse than a model that fails.
+#
+# Two kinds are mixed deliberately and are labelled as such: NON-VACUITY probes
+# (the workload really does reach the interesting states) and MUTATIONS (breaking
+# a load-bearing rule really does break an invariant).
+verify-tla-negative:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd verification/tla
+    expect_violation() {
+      local label="$1"; shift
+      echo "--- MUST VIOLATE: $label"
+      if nix shell nixpkgs#tlaplus --command tlc -workers 4 "$@" > /tmp/mv1-neg.log 2>&1; then
+        echo "FAIL: TLC found NO error, but this configuration must produce one."
+        echo "      ($label)"
+        tail -20 /tmp/mv1-neg.log
+        return 1
+      fi
+      grep -E "Error: (Invariant|Deadlock|Temporal)" /tmp/mv1-neg.log | head -2
+      grep -E "distinct states found" /tmp/mv1-neg.log | tail -1
+    }
+    expect_violation "non-vacuity: refusal + rollback + lost CAS + grant all occur" \
+        -config shm_lease_claim_MC_probe.cfg shm_lease_claim_MC.tla
+    expect_violation "non-vacuity: the csOutOfOrder refusal really fires" \
+        -config shm_lease_claim_ord_MC_probe.cfg shm_lease_claim_ord_MC.tla
+    expect_violation "mutation: claim order NOT enforced -> waits-for CYCLE reachable" \
+        -config shm_lease_claim_ord_nocheck_MC.cfg shm_lease_claim_ord_MC.tla
+    expect_violation "mutation: whole-word fit test -> packed BORROW across dimensions" \
+        -config shm_lease_claim_borrow_MC.cfg shm_lease_claim_borrow_MC.tla
+    expect_violation "non-vacuity: all eight wait/wake windows occur in one behaviour" \
+        -config shm_lease_wait_MC_probe.cfg shm_lease_wait_MC.tla
+    expect_violation "mutation: value bumped BEFORE the payload -> stale grant read" \
+        -config shm_lease_wait_order_MC.cfg shm_lease_wait_MC.tla
+    expect_violation "FINDING: publishGrant twice on one slot -> the first grant is LOST" \
+        -config shm_lease_wait_overwrite_MC.cfg shm_lease_wait_MC.tla
+    expect_violation "FINDING: store-load reorder on the bump/waiters pair -> LOST WAKEUP" \
+        -deadlock -config shm_lease_wait_tso_MC.cfg shm_lease_wait_MC.tla
+    echo "--- the safety half of the no-enforcement mutation MUST still hold:"
+    nix shell nixpkgs#tlaplus --command tlc -workers 4 \
+        -config shm_lease_claim_ord_nocheck_safety_MC.cfg shm_lease_claim_ord_MC.tla
+
+# herd7 litmus tests (MV1 gate item (c)): the ordering pairs the structures depend
+# on, under the C11, x86-TSO and AArch64 memory models. This is the tier that
+# settles what TLC structurally cannot — TLC explores sequentially-consistent
+# interleavings and does not model reordering.
+#
+# The runner CHECKS EVERY VERDICT rather than printing output, and four of the
+# thirteen tests are required to be ALLOWED (they are the controls that make the
+# Forbidden verdicts mean something, plus the `:first_target:` finding itself).
+#
+# nixpkgs has NO herdtools7 on aarch64-darwin under any attribute, so
+# `verification/litmus/get-herd7.sh` builds it through opam against the nixpkgs
+# OCaml; it caches into `verification/litmus/herd7-opam` and is skipped when
+# `herd7` is already on PATH. On Linux, prefer `nix shell nixpkgs#herdtools7`.
+verify-litmus:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v herd7 >/dev/null 2>&1; then
+      cached="$(pwd)/verification/litmus/herd7-opam/mv1/bin"
+      if [ ! -x "$cached/herd7" ]; then
+        echo "herd7 not on PATH and not cached; building it (a few minutes)..."
+        verification/litmus/get-herd7.sh
+      fi
+      export PATH="$cached:$PATH"
+    fi
+    verification/litmus/run-litmus.sh
+
 # Format: nimpretty when available.
 format: format-nim
 

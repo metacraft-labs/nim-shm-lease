@@ -19,3 +19,9 @@ benchmarks/bench_claim
 benchmarks/bench_wait
 benchmarks/bench_obsring
 benchmarks/probe_fastpath
+
+# MV1 verification tier: the local opam root `verification/litmus/get-herd7.sh`
+# builds herdtools7 into when nixpkgs has no package for it, and TLC's scratch
+# state directories.
+verification/litmus/herd7-opam/
+verification/tla/states/

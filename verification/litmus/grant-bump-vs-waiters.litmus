@@ -1,0 +1,57 @@
+C grant-bump-vs-waiters
+(*
+ * MV1 :first_target: -- THE ONE ORDERING CLAIM THIS TIER EXISTS TO SETTLE.
+ *
+ * `src/shm_lease/waitword.nim`, the publisher's pair:
+ *
+ *     publishValue(base, off, cur + 1)     # storeU32Release  -> value
+ *     wakeAll(base, off, scope)            # loadU32SeqCst    <- waiters
+ *
+ * and the waiter's pair in `waitOn`:
+ *
+ *     discard addU32SeqCst(base, off + WwOffWaiters, 1)   # RMW seq_cst -> waiters
+ *     if loadU32SeqCst(base, off + WwOffValue) != expected: ...   # load seq_cst <- value
+ *
+ * This is store-buffering (SB). The forbidden outcome is BOTH sides missing the
+ * other: the waker reads `waiters == 0` and therefore SKIPS THE WAKE SYSCALL,
+ * while the waiter reads the OLD `value` and therefore parks. Nobody wakes it.
+ *
+ * `waitOn`'s docstring justifies this with "sequential consistency on both
+ * accesses gives a single total order in which at least one of the two must
+ * observe the other". THAT JUSTIFICATION IS WRONG AS WRITTEN: the value store is
+ * `ATOMIC_RELEASE`, not seq-cst, so the two accesses of the waker's pair are not
+ * both seq-cst and SC does not apply to them. The code may still be correct --
+ * on ARMv8 `STLR;LDAR` is RCsc and the pair is ordered -- but if so it is correct
+ * for a reason its docstring does not give, which is the state the next person
+ * to optimise it will reason from.
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **ALLOWED / "Sometimes 1 3"** under herd7's
+ * C11 model. The C11 STANDARD permits the lost wakeup, so the docstring's SC
+ * argument is not merely imprecise -- it is unavailable.
+ *
+ * THE HARDWARE VERDICTS ARE THE ONES THAT DECIDE THE CODE, and both were run:
+ *   grant-bump-vs-waiters-x86.litmus      ALLOWED   -- reachable on x86-TSO
+ *   grant-bump-vs-waiters-aarch64.litmus  FORBIDDEN -- excluded by ARMv8 RCsc
+ * and the remedies:
+ *   grant-bump-vs-waiters-SEQCST-fix      FORBIDDEN -- seq-cst store
+ *   grant-bump-vs-waiters-x86-FENCED      FORBIDDEN -- MFENCE between the pair
+ *
+ * See verification/README.md "Finding 2" for what that pair of verdicts licenses
+ * concluding and what it does not.
+ *)
+{
+  value = 0;
+  waiters = 0;
+}
+
+P0 (atomic_int *value, atomic_int *waiters) {
+  atomic_store_explicit(value, 1, memory_order_release);
+  int r0 = atomic_load_explicit(waiters, memory_order_seq_cst);
+}
+
+P1 (atomic_int *value, atomic_int *waiters) {
+  atomic_fetch_add_explicit(waiters, 1, memory_order_seq_cst);
+  int r1 = atomic_load_explicit(value, memory_order_seq_cst);
+}
+
+exists (0:r0 = 0 /\ 1:r1 = 0)

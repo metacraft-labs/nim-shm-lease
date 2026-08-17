@@ -1,0 +1,35 @@
+C grant-bump-vs-waiters-SEQCST-fix
+(*
+ * THE REMEDY IN C, at the level the Nim source is written at: make the value
+ * store SEQ-CST instead of RELEASE, so that the publisher's two accesses really
+ * are both seq-cst and `waitOn`'s docstring becomes TRUE instead of merely
+ * plausible.
+ *
+ * The only difference from `grant-bump-vs-waiters.litmus` is
+ * `memory_order_release` -> `memory_order_seq_cst` on P0's store.
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **FORBIDDEN / "Never 0 3"**, against ALLOWED
+ * for the shipped form. The one-word change is what the difference rests on.
+ *
+ * COST: on x86 a seq-cst store lowers to a LOCKed instruction and on ARM64 to
+ * STLR plus (for baseline ARMv8) a DMB, so this is not free -- but it is on the
+ * WAKE path, which the design already accepts as the expensive path, and not on
+ * either zero-syscall fast path. An `atomicThreadFence(ATOMIC_SEQ_CST)` between
+ * the two accesses is the equivalent and is what obsring already does.
+ *)
+{
+  value = 0;
+  waiters = 0;
+}
+
+P0 (atomic_int *value, atomic_int *waiters) {
+  atomic_store_explicit(value, 1, memory_order_seq_cst);
+  int r0 = atomic_load_explicit(waiters, memory_order_seq_cst);
+}
+
+P1 (atomic_int *value, atomic_int *waiters) {
+  atomic_fetch_add_explicit(waiters, 1, memory_order_seq_cst);
+  int r1 = atomic_load_explicit(value, memory_order_seq_cst);
+}
+
+exists (0:r0 = 0 /\ 1:r1 = 0)

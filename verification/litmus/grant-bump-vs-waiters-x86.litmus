@@ -1,0 +1,35 @@
+X86 grant-bump-vs-waiters-x86
+(*
+ * MV1 :first_target:, ON THE MODEL THAT DECIDES IT.
+ *
+ * The C11 companion (`grant-bump-vs-waiters.litmus`) asks what the STANDARD
+ * permits. This asks what x86-TSO permits, which is the question that was never
+ * exercised because this code has only ever run on arm64.
+ *
+ * P0 is the publisher, `publishGrant` -> `wakeAll`:
+ *     storeU32Release(value, cur + 1)   ->  a plain MOV store on x86
+ *     loadU32SeqCst(waiters)            ->  a plain MOV load on x86
+ * A release store needs no barrier on TSO and a seq-cst LOAD needs none either,
+ * so the compiler emits two plain MOVs and NOTHING orders the store against the
+ * later load.
+ *
+ * P1 is the waiter, `waitOn`:
+ *     addU32SeqCst(waiters, 1)          ->  a LOCKed RMW: a full barrier
+ *     loadU32SeqCst(value)              ->  a plain MOV load
+ * The waiter's side is fully ordered by its own LOCK prefix. That does not help,
+ * because the reordering that matters is P0's.
+ *
+ * The `exists` clause is the LOST WAKEUP: the publisher sees `waiters == 0` and
+ * skips the wake syscall, while the waiter sees the OLD value and therefore parks
+ * -- and the kernel's compare-and-park re-reads that same old value and puts it to
+ * sleep.
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **ALLOWED / "Sometimes 1 3"**. The window is
+ * ARCHITECTURALLY REACHABLE on x86-TSO. See `-FENCED` for the remedy, and
+ * ../README.md for what this does and does not license concluding.
+ *)
+{ value=0; waiters=0; 1:EBX=1; }
+ P0                 | P1                 ;
+ MOV [value],$1     | XCHG [waiters],EBX ;
+ MOV EAX,[waiters]  | MOV EAX,[value]    ;
+exists (0:EAX=0 /\ 1:EAX=0)

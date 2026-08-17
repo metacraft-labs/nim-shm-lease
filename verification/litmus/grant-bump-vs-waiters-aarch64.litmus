@@ -1,0 +1,31 @@
+AArch64 grant-bump-vs-waiters-aarch64
+(*
+ * MV1 :first_target: on the OTHER model that decides it -- and the one this code
+ * has actually been running on.
+ *
+ * P0, the publisher: STLR (the release store of `value`) then LDAR (the seq-cst
+ * load of `waiters`). ARMv8's release/acquire pair is **RCsc**, which means an
+ * LDAR may not be reordered before an earlier STLR. That, and not the docstring's
+ * SC argument, is what makes the shipped code safe here.
+ *
+ * P1, the waiter: LDADDAL (the seq-cst `atomicAddFetch` on `waiters`; a baseline
+ * ARMv8.0 target emits an LDAXR/STLXR loop instead, which is also acquire-release)
+ * then LDAR of `value`.
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **FORBIDDEN / "Never 0 3"**.
+ *
+ * READ THIS TOGETHER WITH THE x86 RESULT. The pair of verdicts is the finding:
+ * the code is correct on the architecture it runs on, for a reason its docstring
+ * does not give, and formally broken on the architecture it has never run on.
+ * That is the worst state to leave an ordering argument in, because the next
+ * person to optimise it will reason from the docstring.
+ *)
+{
+0:X0=value; 0:X1=waiters;
+1:X0=value; 1:X1=waiters;
+}
+ P0             | P1                 ;
+ MOV W2,#1      | MOV W2,#1          ;
+ STLR W2,[X0]   | LDADDAL W2,W4,[X1] ;
+ LDAR W3,[X1]   | LDAR W3,[X0]       ;
+exists (0:X3=0 /\ 1:X3=0)

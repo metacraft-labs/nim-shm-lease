@@ -1,0 +1,25 @@
+X86 grant-bump-vs-waiters-x86-FENCED
+(*
+ * THE REMEDY for `grant-bump-vs-waiters-x86.litmus`, and the reason that result
+ * is actionable rather than merely alarming: one MFENCE between the value bump
+ * and the load of `waiters`.
+ *
+ * In C that is `atomicThreadFence(ATOMIC_SEQ_CST)` after `publishValue` and
+ * before `wakeAll` reads the waiter count -- which is EXACTLY the Dekker pairing
+ * `src/shm_lease/obsring.nim` already applies to its structurally identical
+ * idle-token / `tail - head` pair, "rather than relying on whatever ordering a
+ * particular CAS mapping happens to emit on ARM64". The same library already
+ * contains the fix; it is just not applied here.
+ *
+ * (Making the value store SEQ-CST instead would also work -- on x86 that lowers
+ * to a LOCKed instruction, which is a full barrier. See
+ * `grant-bump-vs-waiters-SEQCST-fix.litmus` for that form in C.)
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **FORBIDDEN / "Never 0 3"**.
+ *)
+{ value=0; waiters=0; 1:EBX=1; }
+ P0                 | P1                 ;
+ MOV [value],$1     | XCHG [waiters],EBX ;
+ MFENCE             | MOV EAX,[value]    ;
+ MOV EAX,[waiters]  |                    ;
+exists (0:EAX=0 /\ 1:EAX=0)

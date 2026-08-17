@@ -1,0 +1,38 @@
+C budget-cas-atomicity
+(*
+ * THE ASSUMPTION `claimWord` RESTS ON: RMW ATOMICITY.
+ *
+ * Two claimants read the same `remaining` and both compare-exchange it to the
+ * decremented value. AT MOST ONE MAY SUCCEED -- if both did, the two claims would
+ * have overcommitted the budget by exactly one vector, which is the lost update
+ * the TLA+ model's `ConservationExact` asserts cannot happen. TLC proves the
+ * PROTOCOL is right given atomic RMW; this asserts the RMW itself.
+ *
+ * `remaining` starts at 2 (one packed field, radix large enough not to matter
+ * here); each claimant wants 1.
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **FORBIDDEN / "Never 0 2"** -- coherence gives
+ * a location one modification order, so two CAS operations cannot both succeed
+ * from the same value. A model that ALLOWED it would mean the whole claim design
+ * is unsound on that architecture, so this is the test whose failure would be
+ * catastrophic rather than interesting.
+ *
+ * NOTE ON SYNTAX: herd7's C dialect does NOT accept `&expected` -- it takes the
+ * CAS's expected operand as a LOCATION, so the per-process expected values live
+ * in `e0` and `e1` rather than in a stack variable. Established by running it.
+ *)
+{
+  remaining = 2;
+  e0 = 2;
+  e1 = 2;
+}
+
+P0 (atomic_int *remaining, int *e0) {
+  int r0 = atomic_compare_exchange_strong_explicit(remaining,e0,1,memory_order_acq_rel,memory_order_acquire);
+}
+
+P1 (atomic_int *remaining, int *e1) {
+  int r1 = atomic_compare_exchange_strong_explicit(remaining,e1,1,memory_order_acq_rel,memory_order_acquire);
+}
+
+exists (0:r0 = 1 /\ 1:r1 = 1)

@@ -1,0 +1,18 @@
+X86 grant-payload-publish-x86-RELAXED-control
+(*
+ * THE OTHER HALF OF THE TRAP. The SAME relaxed message-passing code as
+ * `grant-payload-publish-aarch64-RELAXED-control.litmus`, on x86-TSO.
+ *
+ * RESULT (herd7 7.58, 2026-08-17): **FORBIDDEN / "Never"** -- TSO keeps stores in
+ * program order and does not reorder the two loads in a way that matters here, so
+ * the bug is INVISIBLE on x86 while being ALLOWED on ARMv8.
+ *
+ * This is why `../README.md` insists that dynamic testing on one architecture is
+ * not evidence about another, and why the release/acquire annotations in
+ * `publishGrant` are load-bearing rather than stylistic.
+ *)
+{ value=0; payload=0; }
+ P0                 | P1                 ;
+ MOV [payload],$42  | MOV EAX,[value]    ;
+ MOV [value],$1     | MOV EBX,[payload]  ;
+exists (1:EAX=1 /\ 1:EBX=0)
