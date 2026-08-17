@@ -174,6 +174,11 @@ else:
 
   echo "probe_obs_contention: ", iters, " appends per producer, ", reps,
     " repetitions per configuration, one SHARED ring, nobody draining"
+  # A probe that measured NOTHING must not exit 0. Rejecting a contaminated run
+  # is the right behaviour, but `just bench` reads the exit code, so a silent
+  # refusal would go green while reporting no number at all — the same false-green
+  # shape as a `tee` pipeline without `pipefail`, which this repo already had once.
+  var anyConfigUnusable = false
   for producers in ProducerCounts:
     # DISCARDED WARM-UP REPETITION, the same convention M4's phase B uses: a child
     # that has just come off a blocking read pays the frequency ramp, a cold i-cache
@@ -198,6 +203,7 @@ else:
       perRepMean.add(sum / float(samples.len))
     if perRepMean.len == 0:
       echo "  producers=", producers, ": no usable repetition"
+      anyConfigUnusable = true
       continue
     var best = perRepMean[0]
     var worst = perRepMean[0]
@@ -207,3 +213,8 @@ else:
     echo "  producers=", producers, "  ", fmt2(best), "-", fmt2(worst),
       " ns/append (mean per producer, range over ", perRepMean.len,
       " repetitions; individual producers ", fmt2(lo), "-", fmt2(hi), ")"
+
+  if anyConfigUnusable:
+    echo "probe_obs_contention: FAILED — at least one configuration produced no ",
+      "usable repetition, so this probe measured nothing"
+    quit(1)
