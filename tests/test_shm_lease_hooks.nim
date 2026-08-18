@@ -106,6 +106,25 @@ suite "schedule-hook coverage at every CAS and publish site":
     check obs.awaitRecord(timeoutNs = 5_000_000'i64) == owrTimedOut
     obs.detach()
 
+    # --- M5: the arbiter's CAS, publish AND ROLE-TRANSFER seams -------------
+    # The role transfer is the site the design spec names that the earlier
+    # milestones had nothing to intercept. One full round reaches all of them: the
+    # acquisition CAS (before + after), the ledger CASes of the raise and scan
+    # passes, the commit CAS inside the role word, the sequence advance, the budget
+    # recompute, the grant publication and the role release.
+    let apath = freshPath("coverage-arb")
+    defer: cleanup(apath)
+    var al = createLeaseSegment(apath, [vec(8, 8, 8, 8)], requestSlots = 4)
+    check al.available
+    var ac = al.arbiterClient(0)
+    check ac.registerSlot(0)
+    check ac.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    var around: CombineRound
+    check ac.tryCombine(around) == cbCommitted
+    check ac.collectAnswer() == ansGranted
+    check ac.releaseGrant()              # the ledger CAS of a release
+    al.detach()
+
     setScheduleHook(nil)
     # A seam nothing ever reaches is not a seam.
     for p in SchedulePoint:
@@ -569,3 +588,268 @@ suite "M4 deterministic interleavings: an append vs the consumer's park":
     check gObsParks == 1                 # it really did sleep, exactly once
     check ring.signalCount() == 0'u64
     ring.detach()
+
+# ===========================================================================
+# M5 deterministic interleavings: the ROLE-TRANSFER site.
+# ===========================================================================
+#
+# The design spec's condition of adoption names "every CAS, publish, AND
+# ROLE-TRANSFER site", and the role transfer is the one the earlier milestones had
+# nothing to intercept. What these tests drive is the interleaving MV2 says a
+# kill-injection suite CANNOT reach — the FALSE-POSITIVE STEAL: a combiner
+# descheduled at its commit point, stolen from while it is not running, and then
+# RESUMED onto a round it no longer owns. Every step it then takes is a real step
+# rather than an abort, which is exactly what makes it dangerous.
+#
+# The steal is performed from INSIDE the hook, on the combiner's own call stack.
+# That is not a simplification of the two-process case, it is the same schedule:
+# the hook suspends the combiner between the decision and the commit, another
+# client's acquisition CAS lands, and the combiner then executes its commit
+# against a word that has moved. A second thread would add scheduling noise to a
+# schedule that is already exact.
+
+var
+  gArbView: ArbiterView
+  gStealerSlot: int
+  gStealFired: bool
+  gStealEpoch: uint32
+  gPubForged: bool
+  gForgedSlot: int
+  gForgedVal: uint32
+
+proc stealAtCommitHook(p: SchedulePoint) {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    if p == slpBeforeCommitCas and not gStealFired:
+      gStealFired = true
+      var cur = gArbView.roleSnapshot()
+      gStealEpoch = roleEpoch(cur) + 1'u32
+      discard gArbView.casRoleWord(cur,
+        roleWord(uint16(gStealerSlot), gStealEpoch, false))
+
+proc forgePublishHook(p: SchedulePoint) {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    if p == slpBeforeGrantPublish and not gPubForged:
+      gPubForged = true
+      # Another publisher gets there first: it moves the value word to the same
+      # epoch this combiner is about to write. Under the shipped rule the answer is
+      # then already delivered, and this combiner's CAS must fail rather than
+      # deliver it a second time.
+      let vp = cast[ptr uint32](addr gArbView.base[
+        gArbView.slotOffset(gForgedSlot) + RqOffValue])
+      vp[] = gForgedVal
+
+suite "M5 deterministic interleavings: the role-transfer site":
+  test "a combiner stolen from AT ITS COMMIT cannot commit, and leaves no trace":
+    # `verification/tla/shm_lease_combine_unfenced_MC.cfg` violates `NeverBoth` on
+    # a 13-state trace when the commit lands in a word the steal did not touch.
+    # Here the commit IS the role word, so this is the same schedule with the
+    # shipped layout — and the round simply fails.
+    let path = freshPath("m5steal")
+    defer: cleanup(path)
+    var l = createLeaseSegment(path, [vec(8, 8, 8, 8)], requestSlots = 4)
+    check l.available
+    var a = l.arbiterClient(0)
+    check a.registerSlot(0)
+    var b = l.arbiterClient(1)
+    check b.registerSlot(1)
+    check a.publishRequest(vec(2, 2, 1, 2)) == psPublished
+    check b.publishRequest(vec(2, 2, 1, 2)) == psPublished
+
+    gArbView = a.view
+    gStealerSlot = 1
+    gStealFired = false
+    setScheduleHook(stealAtCommitHook)
+    var r: CombineRound
+    let st = a.tryCombine(r)
+    setScheduleHook(nil)
+
+    check gStealFired
+    check st == cbFenced                 # <-- THE COMMIT CAS FAILED
+    check r.status == cbFenced
+    # THE ROUND LEFT NO TRACE. Nothing was published, nobody was woken, the
+    # sequence never advanced, and not one of its proposals is effective.
+    check r.published == 0
+    check r.wakes == 0
+    check a.view.combineSeq() == 0'u32
+    check a.view.valueAt(0) == 0'u32
+    check a.view.valueAt(1) == 0'u32
+    check a.view.heldSum() == ResourceVec()
+    check a.collectAnswer() == ansNone
+    # The stealer holds the role at the higher epoch, uncommitted.
+    check roleOwner(a.view.roleSnapshot()) == 1'u16
+    check roleEpoch(a.view.roleSnapshot()) == gStealEpoch
+    check not roleCommitted(a.view.roleSnapshot())
+
+    # ...AND ADMISSION RECOVERS. The stealer runs the round to completion, and
+    # both requests — including the one the fenced combiner had decided — are
+    # answered exactly once.
+    var r2: CombineRound
+    check b.tryCombine(r2) == cbCommitted
+    check r2.grants == 2
+    check a.collectAnswer() == ansGranted
+    check b.collectAnswer() == ansGranted
+    check a.view.heldSum() == vec(4, 4, 2, 4)
+    # BudgetExact's shape at quiescence: the word equals what the ledger says.
+    check a.view.budgetCache() == vec(8, 8, 8, 8) - vec(4, 4, 2, 4)
+    check a.view.valueAt(0) == r2.epoch
+    check a.view.valueAt(1) == r2.epoch
+    l.detach()
+
+  test "an answer published by somebody else is NOT delivered or woken twice":
+    # The publication is `payload, then CAS the value, then wake`. The CAS is what
+    # makes the wake belong to the publisher that actually MOVED the word — so a
+    # resurrected combiner racing a stealer through the same publication cannot
+    # manufacture a second wake for one grant. This drives that race exactly.
+    let path = freshPath("m5pub")
+    defer: cleanup(path)
+    var l = createLeaseSegment(path, [vec(8, 8, 8, 8)], requestSlots = 4)
+    check l.available
+    var a = l.arbiterClient(0)
+    check a.registerSlot(0)
+    check a.publishRequest(vec(1, 1, 1, 1)) == psPublished
+
+    gArbView = a.view
+    gPubForged = false
+    gForgedSlot = 0
+    gForgedVal = 1'u32                   # the epoch this round will publish
+    setScheduleHook(forgePublishHook)
+    var r: CombineRound
+    check a.tryCombine(r) == cbCommitted
+    setScheduleHook(nil)
+
+    check gPubForged
+    check r.epoch == 1'u32
+    check r.grants == 1                  # the grant was DECIDED...
+    check r.published == 0               # ...but this round did not deliver it...
+    check r.wakes == 0                   # ...so it issued no wake for it either
+    check a.view.valueAt(0) == 1'u32     # the word moved exactly once, to the epoch
+    # The waiter still collects its answer exactly once: the value word is the
+    # publication marker, and it does not matter which publisher moved it.
+    check a.collectAnswer() == ansGranted
+    l.detach()
+
+# ===========================================================================
+# M5 recovery: a combiner that dies BETWEEN THE COMMIT AND THE PUBLISH.
+# ===========================================================================
+#
+# THIS IS A REGRESSION TEST FOR A DEADLOCK THE ADMISSION GATES INTRODUCED, and it
+# is the one window the earlier M5 tests do not cover. `tryCombine` steps 5..8 are
+# `commit CAS`, `repairSequence`, `refreshBudgetCache`, `publish loop`. A combiner
+# that dies anywhere in that window leaves slot `j` with an EFFECTIVE `[e, ldGrant]`
+# entry, `cseq == e`, state `rqPending`, and its value word NEVER MOVED. A later
+# round's publish loop is the DESIGNED recovery — that is the whole reason
+# constraint 3 puts the epoch in the published value ("a stealer republishing a
+# dead combiner's answer writes the same word twice").
+#
+# Two gates added to bound empty rounds each blocked that recovery on its own:
+#   * `decidableWork` counted slot `j`'s OWN grant into `held`, so the pending
+#     request no longer fitted `capacity - held` and was not refusable either. The
+#     predicate said "nothing to do" and the role was never taken; and
+#   * step 4b (`stamped == 0` abandons the round) returned BEFORE step 8, so even a
+#     round that did take the role handed it back without publishing.
+# Measured against the pre-gate code: one round RECOVERED. Against the gated code:
+# 199 rounds, `cbNoWork` every time, the answer never delivered.
+#
+# The `slpBeforeGrantPublish` seam makes the crash EXACT rather than stochastic —
+# no kill-injection harness (M7) is needed, because the child dies at a named
+# program point rather than at a sampled instant.
+
+proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+
+var gDieAtGrantPublish = false
+
+proc dieAtGrantPublishHook(p: SchedulePoint) {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    if p == slpBeforeGrantPublish and gDieAtGrantPublish:
+      # The payload is already stored; the VALUE word has not moved. This is the
+      # state the ledger cannot distinguish from "published" and the value word
+      # can.
+      cExit(0)
+
+suite "M5 recovery: a committed-but-unpublished answer":
+  test "a combiner killed between the commit and the publish is recovered from":
+    let path = freshPath("m5strand")
+    defer: cleanup(path)
+    let cap = vec(8, 64, 8, 100)
+    var l = createLeaseSegment(path, [cap], requestSlots = 2)
+    check l.available
+
+    # Slot 0 is the WAITER, and it asks for MORE THAN HALF the capacity on every
+    # dimension. That is what makes the stranded state a deadlock rather than a
+    # delay: once its own grant is effective, the free capacity can never fit the
+    # same request again, so a predicate that reads the ledger says "nothing to do"
+    # about the very slot that needs publishing.
+    var a = l.arbiterClient(0)
+    check a.registerSlot(0)
+    check a.publishRequest(vec(5, 40, 5, 60)) == psPublished
+    let v = a.view
+    check v.workPending()
+    check v.decidableWork()              # before the crash: plainly grantable
+
+    # The COMBINER is a separate process, and it dies at the seam.
+    let pid = fork()
+    if pid == 0:
+      var l2 = attachLeaseSegment(path)
+      var b = l2.arbiterClient(1)
+      doAssert b.registerSlot(1)
+      setScheduleHook(dieAtGrantPublishHook)
+      gDieAtGrantPublish = true
+      var rc: CombineRound
+      discard b.tryCombine(rc)
+      cExit(9)                           # unreachable: the hook exits first
+    check pid > 0
+    var st: cint
+    check waitpid(pid, st, 0) == pid
+    check st == 0                        # it died AT THE HOOK, not on an assertion
+
+    # THE STRANDED STATE, spelled out. The round COMMITTED — its entry is effective
+    # and the sequence caught up — and the answer was never delivered.
+    check ledgerDec(v.ledgerAt(0)) == ldGrant
+    check ledgerEpoch(v.ledgerAt(0)) == 1'u32
+    check v.combineSeq() == 1'u32        # committed: the entry IS effective
+    check v.valueAt(0) == 0'u32          # ...and the value word never moved
+    check not v.answerArrived(0)
+    check v.heldSum() == vec(5, 40, 5, 60)
+
+    # THE REGRESSION ASSERTION. `workPending` is true, and an admission gate that
+    # reads the ledger must agree: an effective decision whose answer is still
+    # unpublished is DECIDABLE WORK — it needs publishing, not deciding. This is
+    # the assertion that fails against the gated code.
+    check v.workPending()
+    check v.decidableWork()
+
+    # ...AND A SURVIVOR ACTUALLY RECOVERS. The waiter drives rounds itself, which is
+    # the friendliest possible case and is exactly what `combineUntilAnswered` does.
+    a.stealAfterNs = 1_000_000
+    a.anchorProbeAfterNs = 1_000_000
+    var r: CombineRound
+    var rounds = 0
+    for i in 0 ..< 100:
+      inc rounds
+      discard a.tryCombine(r)
+      if v.answerArrived(0): break
+      sleep(2)
+    check v.answerArrived(0)
+    check rounds < 100
+    check v.valueAt(0) == 1'u32          # the ENTRY'S epoch, not `value + 1`
+    check r.published == 1               # republication delivered exactly one answer
+    check r.wakes == 1
+    check a.collectAnswer() == ansGranted
+    check v.heldSum() == vec(5, 40, 5, 60)
+
+    # AND THE LIVELOCK FIX SURVIVES IT. The recovering round stamped nothing, so it
+    # must NOT have committed and must NOT have advanced the sequence: it published
+    # and handed the role back uncommitted. `cseq` is still the dead combiner's
+    # epoch, and `roundsCommitted` is zero.
+    check a.stats.roundsCommitted == 0'u64
+    check v.combineSeq() == 1'u32
+
+    # IDEMPOTENT: a further round republishes nothing and burns no epoch.
+    let epochAfter = roleEpoch(v.roleSnapshot())
+    var r2: CombineRound
+    check a.tryCombine(r2) == cbNoWork
+    check r2.published == 0
+    check r2.wakes == 0
+    check roleEpoch(v.roleSnapshot()) == epochAfter
+    check v.combineSeq() == 1'u32
+    l.detach()

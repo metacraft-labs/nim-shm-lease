@@ -71,6 +71,29 @@ type
     slpBeforeObsConsumerPark ## the consumer has registered, re-checked the ring AND
                             ## the value, and is about to sleep. Pausing here is
                             ## what lets a test publish into the pre-park window
+    # --- M5: the flat-combining arbiter (`shm_lease/arbiter`) ----------------
+    #
+    # The design spec's condition of adoption names "every CAS, publish, AND
+    # ROLE-TRANSFER site", and the role transfer is the one the earlier
+    # milestones had nothing to intercept. MV2's model says why each of these is
+    # a race site rather than a step: the acquisition CAS is what FENCES the
+    # previous owner (every acquisition, clean or stolen, bumps the epoch), and
+    # the commit CAS is the round's LINEARISATION POINT — a combiner descheduled
+    # immediately before it, stolen from, and then resumed is the
+    # false-positive-steal behaviour a kill-injection suite cannot reach
+    # (`verification/README.md` Finding 4). Pausing at `slpBeforeCommitCas` and
+    # stealing the role from another handle drives exactly that interleaving
+    # deterministically.
+    slpBeforeRoleCas        ## about to CAS the combiner role word (acquire or STEAL)
+    slpAfterRoleCas         ## the role CAS returned (won or lost)
+    slpBeforeLedgerCas      ## about to CAS a per-slot ledger entry (raise or decide)
+    slpBeforeCommitCas      ## the round is decided; about to CAS the commit flag
+                            ## INSIDE the role word — the linearisation point
+    slpBeforeSeqAdvance     ## about to advance the monotone combine sequence
+    slpBeforeBudgetRefresh  ## about to recompute the budget CACHE from the ledger
+    slpBeforeGrantPublish   ## outcome payload stored; about to CAS the waiter's
+                            ## value word to the combine epoch
+    slpBeforeRoleRelease    ## about to CAS the role word back to unowned
 
   ScheduleHook* = proc (point: SchedulePoint) {.gcsafe, raises: [].}
 

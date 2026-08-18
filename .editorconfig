@@ -33,10 +33,13 @@ indent_style = unset
 [*.nim]
 indent_size = unset
 
-# The verification tier's README. Its model and litmus tables are column-aligned
-# by hand so names, state counts and depths read straight in a terminal, and the
-# verdict tables are transcribed from herd7 output. Same reasoning as
-# .prettierignore, which covers the same file for the same reason.
-[verification/README.md]
+# Markdown. Indentation is structural here -- it decides list nesting and what
+# is a code block -- and continuation lines under a bullet idiomatically land on
+# odd columns. editorconfig-checker's multiple-of-two rule does not model that,
+# and prettier already owns markdown formatting in this repo (see the pre-commit
+# config), so let it. The verification tier's README additionally has tables
+# aligned by hand so state counts read straight in a terminal, which is why
+# .prettierignore exempts that one file from prettier as well.
+[*.md]
 indent_size = unset
 indent_style = unset

@@ -53,13 +53,20 @@ build:
     nim c {{nim-flags}} {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_obs_multiprocess \
         tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee -a test-logs/build.log
+    nim c {{nim-flags}} {{src-paths}} -d:release \
+        -o:test-logs/test_shm_lease_arbiter \
+        tests/test_shm_lease_arbiter.nim 2>&1 | tee -a test-logs/build.log
+    nim c {{nim-flags}} {{src-paths}} -d:release \
+        -o:test-logs/test_shm_lease_arbiter_multiprocess \
+        tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | tee -a test-logs/build.log
     nim c {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
         -o:test-logs/test_shm_lease_hooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/build.log
 
 # Test: the whole suite. Deterministic — no flaky stress in `test`.
 test: test-unit test-integration test-waitword test-wait-integration \
-      test-fence-shape test-obsring test-obs-integration test-hooks
+      test-fence-shape test-obsring test-obs-integration test-arbiter \
+      test-arbiter-integration test-hooks
 
 # Unit: packed-budget arithmetic, fixed-claim-order enforcement, boot+pid+start-time
 # anchoring, over-release refusal, and the NEGATIVE controls proving the overcommit
@@ -163,6 +170,43 @@ test-obs-integration:
     mkdir -p test-logs
     nim c -r {{nim-flags}} {{src-paths}} \
         tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee test-logs/test-obs-integration.log
+
+# M5 unit: THE FLAT-COMBINING ARBITER, against the four constraints MV2 derived
+# BEFORE this code existed (`verification/tla/shm_lease_combine.tla`). One suite per
+# constraint, each with a POSITIVE assertion and — where the mechanism can be switched
+# off — a NEGATIVE CONTROL that switches exactly that one off and requires the damage
+# to appear: an incrementally decremented budget word destroying capacity, a fit test
+# blind to its own proposals overcommitting, a counter-bump publication making wakes
+# exceed grants, and a raise pass without serialisation erasing a collected grant.
+# Also: the commit CAS failing after a steal (Finding 4, executed), the steal
+# detector's two halves shown to be separately load-bearing, `publishGrant`'s
+# inherited precondition refused by construction, and a round measured at ZERO
+# syscalls against a forced-syscall control.
+test-arbiter:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    nim c -r {{nim-flags}} {{src-paths}} \
+        tests/test_shm_lease_arbiter.nim 2>&1 | tee test-logs/test-arbiter.log
+
+# M5 integration: THE M5 GATE. Real processes at DELIBERATELY DIFFERING virtual
+# bases, with the ARBITER ROLE MIGRATING BETWEEN THEM — structurally, not by luck:
+# a child does not begin the measured workload until it has personally owned the
+# role, every child's first request is on the board before any round may run, and
+# no child may leave until the parent says all are done. Asserts (a) wakes <=
+# grants under a release that frees capacity for four PARKED waiters, (b) no waiter
+# is ever woken without its answer, and (c) every decision of every committed round
+# is identical to a single-threaded reference implementation replayed in epoch
+# order. Plus the two controls that give those teeth: a single-combiner run of the
+# same workload (ONE owner, same reference agreement — packing unchanged by
+# migration) and a deliberately blind fit test the reference is required to catch.
+test-arbiter-integration:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+        tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | \
+        tee test-logs/test-arbiter-integration.log
 
 # EXTERNAL syscall counting for SM-2, the `strace`/`dtruss` half of the milestone's
 # wording. The suite's own SM-2 assertions use the kernel's per-task counter, which
@@ -270,6 +314,8 @@ lint-nim:
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_arbiter.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/fence_shape_driver.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_wait.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log

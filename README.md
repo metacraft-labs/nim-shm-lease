@@ -10,45 +10,47 @@ Sibling to [`nim-shm-queue`](../nim-shm-queue) (MPSC ring) and
 copy of the same MPSC protocol, so the sibling checkout must be present to build
 `shm_lease/obsring` (`config.nims`, the `Justfile` and the nimble task each thread
 `--path:../nim-shm-queue/src` when the directory exists). This is the POC library of the
-*RunQuota Observation Store & Shared-Memory Transport* campaign —
+_RunQuota Observation Store & Shared-Memory Transport_ campaign —
 `reprobuild-specs/RunQuota-Observation-Store.milestones.org`, phase 1 — and its
 design authority is
 `reprobuild-specs/RunQuota-Shared-Memory-Transport.md`.
 
-## Status: M2 + M3 + M4
+## Status: M2 + M3 + M4 + M5
 
-M2 is the spec's *"§1 the fit check and claim are the easy part"*; M3 is
-*"Waiting Without Spinning"*; M4 is *"The Observation Ring"*. Nothing beyond those
-three. Read the scope honestly before building on it:
+M2 is the spec's _"§1 the fit check and claim are the easy part"_; M3 is
+_"Waiting Without Spinning"_; M4 is _"The Observation Ring"_; M5 is
+_"§3 flat combining puts the policy in shared memory"_. Nothing beyond those four.
+Read the scope honestly before building on it:
 
-| Campaign milestone | What it adds | Here? |
-|---|---|---|
-| **M2** | packed-budget multi-dimensional reservation, no overcommit, position independence | **yes** |
-| **M3** | futex-class cross-process blocking (`futex` / `os_sync_wait_on_address`), per-waiter wait slots | **yes** |
-| **M4** | observation ring: bounded MPSC, counted drops, non-polling consumer (rides `nim-shm-queue`'s Layer 1) | **yes** |
-| M5 | flat-combining arbiter, per-waiter grant slots, grant-then-wake | no |
-| M6 | anti-starvation (bounded wait for large claims) | no |
-| M7 | kill injection, steal protocol, reservation reclamation | no |
-| M8 | preemption study and go/no-go verdict | no |
+| Campaign milestone | What it adds                                                                                          | Here?   |
+| ------------------ | ----------------------------------------------------------------------------------------------------- | ------- |
+| **M2**             | packed-budget multi-dimensional reservation, no overcommit, position independence                     | **yes** |
+| **M3**             | futex-class cross-process blocking (`futex` / `os_sync_wait_on_address`), per-waiter wait slots       | **yes** |
+| **M4**             | observation ring: bounded MPSC, counted drops, non-polling consumer (rides `nim-shm-queue`'s Layer 1) | **yes** |
+| **M5**             | flat-combining arbiter: a migrating role, per-waiter grant slots, grant-then-wake                     | **yes** |
+| M6                 | anti-starvation (bounded wait for large claims)                                                       | no      |
+| M7                 | kill injection, steal protocol, reservation reclamation                                               | no      |
+| M8                 | preemption study and go/no-go verdict                                                                 | no      |
 
-The single most important thing this library is **not**: an admission *policy*.
-The design spec's §2 is explicit that a pure CAS loop admits whoever arrives first
-and happens to fit, which **starves large claims** — a link action needing 8 GiB
-can lose indefinitely to a stream of 512 MiB compiles, and RunQuota exists
-precisely to keep memory-heavy actions schedulable. That is SM-4, it is M6's gate,
-and it is not solved here. What is here is the correct, overcommit-free substrate a
-policy is built on.
+The single most important thing this library is still **not**: an anti-starvation
+admission _policy_. M5 adds the arbiter — a global view, taken by whichever client
+holds the migrating role — so the policy now has somewhere to live, and it makes
+bulk admission and grant-then-wake real. But the policy it runs is **first fit in
+slot order**, which starves large claims exactly as the design spec's §2 warns: a
+link action needing 8 GiB can lose indefinitely to a stream of 512 MiB compiles.
+Holding capacity idle for a pending large claim is SM-4, it is M6's gate, and it is
+deliberately not implemented here.
 
 ## The packed budget word
 
 Four 16-bit fields, little end first:
 
-| bits | dimension | ceiling |
-|---|---|---|
-| 0–15 | CPU slots | 65535 slots |
+| bits  | dimension               | ceiling                            |
+| ----- | ----------------------- | ---------------------------------- |
+| 0–15  | CPU slots               | 65535 slots                        |
 | 16–31 | memory, in 64 MiB units | 65535 × 64 MiB = 4095 GiB (~4 TiB) |
-| 32–47 | process count | 65535 processes |
-| 48–63 | IO weight | 65535 weight units |
+| 32–47 | process count           | 65535 processes                    |
+| 48–63 | IO weight               | 65535 weight units                 |
 
 4 × 16 = 64 exactly. Every ceiling is orders of magnitude past any real build host,
 so **64-bit CAS is sufficient and no 128-bit CAS (`cmpxchg16b` / `CASP`) is used**
@@ -63,7 +65,7 @@ is the OOM the component exists to prevent.
 
 **Borrow safety is why the fit test is not optional.** A packed subtraction is
 field-wise only while every field difference is non-negative; one underflowing
-field borrows from the field above and corrupts a *different* dimension. So the
+field borrows from the field above and corrupts a _different_ dimension. So the
 claim is: read → `fitsPacked` per dimension → CAS the decremented value → retry.
 `tests/test_shm_lease.nim` demonstrates the corruption directly, and
 `tests/test_shm_lease_multiprocess.nim` runs the whole multi-process gate with the
@@ -73,12 +75,12 @@ fit test removed and asserts the invariant checker catches it.
 
 Per-machine and per-pool budgets get their own words:
 
-* word `0` (`MachineBudgetIndex`) — the per-machine budget;
-* word `1 + p` (`poolBudgetIndex(p)`) — pool `p`'s budget.
+- word `0` (`MachineBudgetIndex`) — the per-machine budget;
+- word `1 + p` (`poolBudgetIndex(p)`) — pool `p`'s budget.
 
 **Claim order is ascending word index; rollback and release are descending.** Since
 every claimant takes words in strictly ascending index order, the waits-for relation
-is a strict order and no cycle is constructible. This is *enforced*, not documented:
+is a strict order and no cycle is constructible. This is _enforced_, not documented:
 `claimWords` returns `csOutOfOrder` for a non-ascending index list rather than
 sorting it, because silently reordering would hide a caller that had built an order
 this library cannot see. A claim is all-or-nothing — a refusal on a later word rolls
@@ -86,10 +88,10 @@ the earlier words back exactly, leaving no trace in the accounting.
 
 ## Engineering playbook (inherited)
 
-Per the design spec's *"The engineering playbook does transfer"*:
+Per the design spec's _"The engineering playbook does transfer"_:
 
 - **File-backed `mmap(MAP_SHARED)`** — the segment survives producer death and `exec`.
-- **Position independence (SM-7)** — only offsets, counts, and packed *values* live
+- **Position independence (SM-7)** — only offsets, counts, and packed _values_ live
   in the segment; never an absolute pointer. `attachLeaseSegment(path, wantBase)`
   maps at a caller-chosen base (`MAP_FIXED`) so this is provable rather than
   asserted; `storedPointerCheck` is a second, heuristic line of defence.
@@ -101,7 +103,7 @@ Per the design spec's *"The engineering playbook does transfer"*:
   consults them (`anchorVerdict` → `avPidReused`) are here from M2, because the spec
   says this discipline cannot be retrofitted.
 - **Deterministic schedule hooks** — `-d:shmLeaseScheduleHooks`, mirroring
-  `-d:shmGSetScheduleHooks`, at *every* budget CAS, release CAS, rollback CAS,
+  `-d:shmGSetScheduleHooks`, at _every_ budget CAS, release CAS, rollback CAS,
   anchor publish, magic publish and rename site. Compile-time no-op otherwise.
 - **Portable no-op arm** — compiles everywhere; `shmLeaseSupported == false` off
   Linux/macOS, where every operation reports unavailable.
@@ -110,19 +112,19 @@ Per the design spec's *"The engineering playbook does transfer"*:
 
 ### The reservation (M2)
 
-| Platform | Status | Note |
-|---|---|---|
-| Linux (x86-64, aarch64) | supported | `boot_id` from `/proc/sys/kernel/random/boot_id`; process start time is field 22 of `/proc/<pid>/stat` |
-| macOS 11+ (arm64, x86-64) | supported | process start time via `sysctl(KERN_PROC/KERN_PROC_PID)` → `kp_proc.p_starttime`; boot identity derived from pid 1's start time |
-| Windows | **not supported** — no-op arm | Deliberate, and inherited from the campaign: the shared-memory transport's Windows *wake* path needs named kernel objects because `WaitOnAddress` is documented as within-process only. The M2 reservation itself would port, but shipping it without M3's wake path would be a half-capability, so Windows reports unavailable and the gap is recorded here rather than silently omitted. |
+| Platform                  | Status                        | Note                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Linux (x86-64, aarch64)   | supported                     | `boot_id` from `/proc/sys/kernel/random/boot_id`; process start time is field 22 of `/proc/<pid>/stat`                                                                                                                                                                                                                                                                                     |
+| macOS 11+ (arm64, x86-64) | supported                     | process start time via `sysctl(KERN_PROC/KERN_PROC_PID)` → `kp_proc.p_starttime`; boot identity derived from pid 1's start time                                                                                                                                                                                                                                                            |
+| Windows                   | **not supported** — no-op arm | Deliberate, and inherited from the campaign: the shared-memory transport's Windows _wake_ path needs named kernel objects because `WaitOnAddress` is documented as within-process only. The M2 reservation itself would port, but shipping it without M3's wake path would be a half-capability, so Windows reports unavailable and the gap is recorded here rather than silently omitted. |
 
 ### The blocking wrapper (M3)
 
-| Platform | Primitive | Minimum version | Cross-process | Note |
-|---|---|---|---|---|
-| Linux (x86-64, aarch64) | `futex(FUTEX_WAIT / FUTEX_WAKE)` **without** `FUTEX_PRIVATE_FLAG` | any | ✓ | A shared futex keys on the underlying **inode + offset**, not the virtual address, which is what lets a file-backed segment mapped at a different base in every process still block correctly. **UNEXERCISED: never run on Linux.** |
-| macOS (arm64, x86-64) | `os_sync_wait_on_address` / `os_sync_wake_by_address_any` / `..._all` with `OS_SYNC_*_SHARED` | **14.4** | ✓ | The symbols are **weak-imported and NULL-checked at run time**, so a binary built against a 14.4 SDK still launches on an older macOS and `waitWordAvailable()` simply returns false there. The minimum version is recorded in `WaitWordMinMacOsVersion` and asserted by the suite. |
-| Windows | — | — | **✗** | **OUT OF SCOPE, recorded not omitted.** `WaitOnAddress` is documented as working only within a process; a cross-process wake needs named kernel objects (a per-waiter named event or semaphore). Note the asymmetry for whoever takes it up: the *fast path* (no wait) still costs zero syscalls on Windows, and only the **wake** needs the named object. |
+| Platform                | Primitive                                                                                     | Minimum version | Cross-process | Note                                                                                                                                                                                                                                                                                                                                                       |
+| ----------------------- | --------------------------------------------------------------------------------------------- | --------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux (x86-64, aarch64) | `futex(FUTEX_WAIT / FUTEX_WAKE)` **without** `FUTEX_PRIVATE_FLAG`                             | any             | ✓             | A shared futex keys on the underlying **inode + offset**, not the virtual address, which is what lets a file-backed segment mapped at a different base in every process still block correctly. **UNEXERCISED: never run on Linux.**                                                                                                                        |
+| macOS (arm64, x86-64)   | `os_sync_wait_on_address` / `os_sync_wake_by_address_any` / `..._all` with `OS_SYNC_*_SHARED` | **14.4**        | ✓             | The symbols are **weak-imported and NULL-checked at run time**, so a binary built against a 14.4 SDK still launches on an older macOS and `waitWordAvailable()` simply returns false there. The minimum version is recorded in `WaitWordMinMacOsVersion` and asserted by the suite.                                                                        |
+| Windows                 | —                                                                                             | —               | **✗**         | **OUT OF SCOPE, recorded not omitted.** `WaitOnAddress` is documented as working only within a process; a cross-process wake needs named kernel objects (a per-waiter named event or semaphore). Note the asymmetry for whoever takes it up: the _fast path_ (no wait) still costs zero syscalls on Windows, and only the **wake** needs the named object. |
 
 `waitWordAvailable()` is the runtime gate and `WaitWordBackend` names the primitive
 actually selected, so a caller can report what it got rather than assume.
@@ -146,11 +148,11 @@ single-consumer drain, atomic **signalled** drop counter — rather than growing
 second copy of the MPSC protocol, and adds the segment, the consumer wait word and
 the completeness accounting on top.
 
-| Platform | Status | Note |
-|---|---|---|
-| Linux (x86-64, aarch64) | supported | inherits `shm_queue`'s POSIX arm and M3's `futex` wake path. **UNEXERCISED: never run on Linux.** |
+| Platform                    | Status                                              | Note                                                                                                                       |
+| --------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Linux (x86-64, aarch64)     | supported                                           | inherits `shm_queue`'s POSIX arm and M3's `futex` wake path. **UNEXERCISED: never run on Linux.**                          |
 | macOS 14.4+ (arm64, x86-64) | supported, and the only platform it has been RUN on | the consumer parks with `os_sync_wait_on_address`; below 14.4 `awaitRecord` reports `owrUnavailable` and a caller degrades |
-| Windows | **not supported** — no-op arm | `createObsRing` returns unavailable; `publish` returns `oprUnavailable`. Recorded, not omitted. |
+| Windows                     | **not supported** — no-op arm                       | `createObsRing` returns unavailable; `publish` returns `oprUnavailable`. Recorded, not omitted.                            |
 
 The rules it enforces, each measured rather than asserted:
 
@@ -164,7 +166,7 @@ The rules it enforces, each measured rather than asserted:
 - **The consumer never polls.** `awaitRecord` parks on the wait word; a quiet ring
   costs zero wakeups.
 - **Producers signal only on the empty-to-non-empty transition** — and exactly ONE
-  producer per transition, because the consumer publishes an *idle token* before it
+  producer per transition, because the consumer publishes an _idle token_ before it
   sleeps and a producer must CAS that token from 1 to 0 to be the signaller. A
   producer's own `tail - head` snapshot would be a lost wakeup: the consumer can
   drain and park in the window between the snapshot and the append.
@@ -180,6 +182,76 @@ Silicon**. Striding the position-independence probe bases by the segment size
 (4 KiB) silently failed with `EINVAL` for every child whose index was not a
 multiple of 4 — reproduced on Darwin 25.5 / arm64. The test now asks
 `sysconf(_SC_PAGESIZE)`.
+
+### The flat-combining arbiter (M5)
+
+The serialization point **stops being a process boundary and becomes a migrating
+role**. Clients publish requests into per-client slots in the lease segment;
+whichever client finds the role free claims it, decides _every_ pending request
+with a full global view, publishes the outcomes into per-waiter slots and wakes
+only the waiters it granted, then releases the role. A client that does not get the
+role neither spins nor parks inside the attempt (SM-8).
+
+**This protocol was modelled before it was written.** `verification/tla/
+shm_lease_combine.tla` (campaign milestone MV2) is a TLA+ model of exactly this
+arbiter — death at every program counter, plus the false-positive steal a
+kill-injection suite cannot reach — and it produced four constraints, each with a
+configuration that fails without it. All four are in the code, and each has a
+negative control in `tests/test_shm_lease_arbiter.nim` that switches it off and
+requires the damage to appear:
+
+| Constraint                                                              | Where it lives                                                                                                                    | What breaks without it                                                                                                                                    |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Commit and role transfer resolve in ONE CAS on ONE word**             | the role word is `[epoch, ownerSlot, committed]` at lease-header offset 96; the commit is `CAS(role, [me,e,false] → [me,e,true])` | a stolen-from combiner commits a round the stealer discarded (`..._unfenced_MC.cfg`, `NeverBoth`, 13-state trace)                                         |
+| **The budget word is a CACHE of the stamped ledger, never decremented** | `refreshBudgetCache` recomputes `capacity − Σ effective grants`; no decision reads the word                                       | a discard between a decrement and its stamp destroys capacity permanently (`..._budget_MC.cfg`, `BudgetExact`, 26 states)                                 |
+| **Per-slot serialisation AND the epoch in the published value**         | the raise pass never restamps an effective entry; the published value is the combine **epoch**, not `value + 1`                   | a collected request granted twice; a stealer republishing a dead combiner's answer (`..._noserial_MC.cfg` and `..._counter_MC.cfg`, both `NoDoubleGrant`) |
+| **The steal detector needs the anchor check AND a bounded timeout**     | `mayStealRole`: boot+pid+start-time verdict fires immediately, the timeout covers a live-but-stalled holder                       | an unsound detector costs **liveness**, not safety — unbounded role churn (`..._livelock_MC.cfg`)                                                         |
+
+Two further rules the model insisted on: _the recovery predicate and the waiter's
+wake predicate must be the same predicate_ — both are the **value word**, since
+testing the ledger or the payload deadlocks the model — and a combine round must be
+bounded, allocation-free and syscall-free, which is measured at **zero syscalls**
+against a forced-syscall control.
+
+M3's `publishGrant` carried a documented precondition — _at most one outstanding
+grant per slot_ — that it could not enforce. M5 satisfies it **by construction**:
+`publishRequest` refuses a slot whose ledger entry is an outstanding grant, so a
+second grant cannot be published because a second request cannot exist.
+
+**Two places M5 leaves the model, stated because they are not checked anywhere.** A
+request that does not fit is left **pending** rather than refused — which is what
+makes a waiter exist at all, and moves it into M6's bounded-waiting property. That
+also means "there is work" stays true for an unfittable request, so the arbiter
+declines to take the role unless something pending can actually be granted,
+permanently refused, **or published**, and a round whose scan stamped nothing
+publishes what is outstanding and then hands the role back uncommitted; otherwise
+the epoch churns without bound, which the model forbids.
+
+**That "or published" is not a detail, and the first version of this gate did not
+have it — it deadlocked.** The admission gate reads the effective ledger, and an
+argument that it therefore cannot hide work is only true of an _uncommitted_ round.
+A combiner that commits and then dies before its publish loop leaves entries that
+_are_ effective and _are_ counted as held, so the slot's own grant makes the slot's
+own request stop fitting and the gate answers "nothing to do" about precisely the
+work that needs doing. Republishing a dead combiner's answer is the _designed_
+recovery — it is why the published value carries the combine epoch — and both the
+gate and the empty-round exit have to let it happen. What is actually true of the
+predicate is narrower: a "no" means every pending slot either already has its
+answer on the value word or wants capacity another slot's effective grant holds,
+and both are states only an event outside the round — a release, or a publication —
+can leave. `tests/test_shm_lease_hooks.nim` kills a real combiner at the
+`slpBeforeGrantPublish` seam and requires the survivor to recover.
+
+And `releaseGrant` has no counterpart in MV2 at all, since the model never gives
+capacity back (reclamation is M7's ground). It is more than unmodelled: it is a
+**writer outside the epoch fence**. Every other ledger mutation is a CAS whose
+expected value carries an epoch that a role acquisition has already invalidated;
+the release CAS carries the entry's _old_ epoch and succeeds whoever holds the
+role. It is safe because a release can only move `grant → released` and so only
+ever _decreases_ the effective sum, because a released entry cannot be raised back
+into a live grant, and because `want` is rewritten only after the decision has been
+cleared — none of which is model-checked. See `src/shm_lease/arbiter.nim`'s
+docstring for the argument in full.
 
 ## API sketch
 
@@ -248,12 +320,36 @@ of oprOversize, oprUnavailable: discard
 # ...and the window can never be presented as complete if it lost anything.
 if client.windowCompleteness(before) == ccTruncated:
   markCaptureIncomplete()
+
+# --- M5: the flat-combining arbiter -------------------------------------------
+
+# OWNER: a lease segment WITH request slots is what makes the arbiter available.
+var l = createLeaseSegment(path, [vec(64, 512, 64, 1000)], requestSlots = 32)
+
+# CLIENT: take a slot (this writes the anchor the steal detector consults) and
+# publish a request. Publishing never blocks and never enters the kernel.
+var c = l.arbiterClient(mySlot)
+doAssert c.registerSlot(mySlot)
+doAssert c.publishRequest(vec(4, 16, 1, 10)) == psPublished
+
+# ...then drive: try to BE the arbiter, and park with a bounded timeout if
+# somebody else already is. Whoever runs the round decides every pending request
+# with a global view and wakes only the waiters it granted.
+var round: CombineRound
+while true:
+  case c.combineUntilAnswered(round, parkNs = 20_000_000)
+  of ansGranted: break                 # the capacity is now HELD by this slot
+  of ansRefused: raise newException(ValueError, "cannot ever fit")
+  else: discard                        # not answered yet; go round again
+
+runTheAction()
+doAssert c.releaseGrant()              # one CAS; the next round redistributes it
 ```
 
 ## Test & benchmark
 
 ```bash
-just test           # unit + the M2, M3 and M4 gates + deterministic interleavings
+just test           # unit + the M2, M3, M4 and M5 gates + deterministic interleavings
 just bench          # POC-local claim/release, wait/wake and per-observation cost
                     # (M1/M8 own the real socket comparison)
 just soak 20        # the M2 gate harness, 20x the rounds per child
@@ -263,7 +359,7 @@ just verify         # the FORMAL tier: TLA+/TLC models + herd7 litmus tests
 ```
 
 `just test-syscalls` is **not** part of `test`: on macOS `dtrace`/`dtruss` need
-root *and* a SIP configuration that permits DTrace, and refuse on a stock host.
+root _and_ a SIP configuration that permits DTrace, and refuse on a stock host.
 The suite's own SM-2 assertions therefore use the kernel's per-task syscall
 counter (`task_info` / `TASK_EVENTS_INFO`), which is exact, needs no privileges,
 and is calibrated in-suite before it is trusted. On Linux there is no cheap
@@ -278,7 +374,7 @@ blessed runner during development — the same convention as `nim-shm-gset`.
 made to run on macOS/arm64: both arms build, then the TSAN binary dies with SIGSEGV
 and the ASan binary hangs in `dyld` before `main`. Reproduced on Darwin 25.5 /
 arm64, not diagnosed, and not claimed as passing anywhere — run it on x86-64 Linux.
-Note also that TSAN/DRD shadow state by *virtual address* while every process maps
+Note also that TSAN/DRD shadow state by _virtual address_ while every process maps
 the segment at its own base, so they structurally cannot observe the cross-mapping
 ordering; that is what the multi-process gate covers.
 
@@ -319,26 +415,26 @@ base**, and asserts:
    the same harness with the fit test removed and requires the checker to fire.
 2. **No lost update** — the shared counters must equal the sum of what each process
    independently believes it did, and, counter-independently, the budget deficit at
-   quiescence must equal the *exact* sum of the reservations the children
+   quiescence must equal the _exact_ sum of the reservations the children
    deliberately still hold.
 3. **Total released == total claimed** — releasing the still-held reservations
    restores `remaining == capacity` bit-for-bit on every word, and one further
    release is refused.
 4. **Position independence (SM-7)** — the parent reserves one `PROT_NONE` region
    before forking, so child `i` maps at `region + i * pageAlignedStride` and the
-   bases are pairwise distinct *by construction*, not by luck. Two forked children
+   bases are pairwise distinct _by construction_, not by luck. Two forked children
    both calling `mmap(nil, ...)` would very likely land at the same address and
    prove nothing.
 
 **Contention is structural, not incidental.** The `retryCount > 0` assertion above
 is load-bearing — without it, "0 overcommit violations" is also the expected result
-of a gate in which no two claims ever raced — so the harness must *guarantee* the
+of a gate in which no two claims ever raced — so the harness must _guarantee_ the
 race rather than hope for it. Two pipe gates do that:
 
 1. **Start barrier** — each child announces "attached" and blocks; the parent
    releases them all with one `close` (a broadcast) only after all N announcements.
-2. **Stop gate** — after its *first* round each child announces "I am inside the
-   loop", and no child may *leave* the loop until the parent closes the stop pipe,
+2. **Stop gate** — after its _first_ round each child announces "I am inside the
+   loop", and no child may _leave_ the loop until the parent closes the stop pipe,
    which it does only after all N announcements. So at the instant the parent holds
    all N, every child is provably inside the loop and none can exit. The parent
    records that instant and the gate asserts it lies inside every child's
@@ -365,7 +461,7 @@ Reclaiming it automatically is M7.
 ### What the M3 gate proves
 
 `tests/test_shm_lease_wait_multiprocess.nim` reuses M2's harness shape — one
-`PROT_NONE` region reserved *before* the fork, `sysconf(_SC_PAGESIZE)` stride,
+`PROT_NONE` region reserved _before_ the fork, `sysconf(_SC_PAGESIZE)` stride,
 `MAP_FIXED` per child, pipe start barrier, report pipe drained before reaping —
 and asserts, in five phases:
 
@@ -376,15 +472,15 @@ and asserts, in five phases:
    the wait word and the direct assertion of the keying rule (inode + offset on
    Linux, `OS_SYNC_*_SHARED` on macOS) rather than an assumption about it.
 2. **Spurious wakeups are tolerated.** The parent injects forced wakes with the
-   value *unchanged* — exactly the event every one of these primitives is
+   value _unchanged_ — exactly the event every one of these primitives is
    permitted to manufacture — and the child must re-validate and re-park rather
-   than report a grant that does not exist. Delivery is *confirmed* through a
+   than report a grant that does not exist. Delivery is _confirmed_ through a
    shared-memory progress counter and re-issued if lost, because a waiter is
    registered a few instructions before it is actually in the kernel and a wake in
    that window is legitimately lost.
 3. **SM-1: a blocked waiter consumes no measurable CPU** over a multi-second
    block — with a **spinning child running the same window as the negative
-   control**, required to *exceed* the same limit. Measured on Darwin 25.5 /
+   control**, required to _exceed_ the same limit. Measured on Darwin 25.5 /
    arm64: 35–51 µs of CPU over a 3.0 s block, against 3.01 s for the spinner —
    a ratio of 59,000–86,000x, with the limit set at 20 ms.
 4. **SM-2: the uncontended fast path costs zero syscalls**, measured in the child
@@ -394,7 +490,7 @@ and asserts, in five phases:
 5. **The cross-process scope is load-bearing.** Two children park under an
    identical schedule, one with the cross-process scope and one with the
    process-local one (`FUTEX_*_PRIVATE` / `OS_SYNC_WAIT_ON_ADDRESS_NONE`). The
-   shared waiter is woken in ~311 ms; the process-local waiter is *not* woken and
+   shared waiter is woken in ~311 ms; the process-local waiter is _not_ woken and
    sits out its full 1.5 s timeout.
 
 Every one of those was **mutation-tested** — removing the fast paths turns 0/0
@@ -403,25 +499,83 @@ blocked child's 51 µs into 3.72 s of CPU; collapsing the process-local scope on
 the shared one makes the keying control return in 303 ms instead of timing out;
 removing the prefault turns a clean timeout into `EFAULT`.
 
-Proves **SM-1** and **SM-2**. Not proven here: SM-3 (no wake amplification), SM-4
-(bounded wait for large claims), SM-6 (no leaked capacity) and SM-8, which belong
-to M5/M6/M7 and are not attempted.
+Proves **SM-1** and **SM-2**. Not proven by the M3 gate: SM-3 (no wake
+amplification), SM-4 (bounded wait for large claims), SM-6 (no leaked capacity) and
+SM-8 — SM-3 and SM-8 are M5's and are proven by the gate below; SM-4 and SM-6 remain
+M6's and M7's and are not attempted.
+
+### What the M5 gate proves
+
+`tests/test_shm_lease_arbiter_multiprocess.nim`, six real processes at deliberately
+differing virtual bases, one run:
+
+1. **The role really migrates, and it is structural.** Every child owns the role
+   before the measured workload starts — it keeps a request outstanding and races
+   for the role until it has committed a round — so the epoch-ordered owner
+   sequence contains all six and has at least five changes of owner. Typical run:
+   41 rounds, **6 distinct owners, 22 owner changes**. The assertion is made
+   **before** the clauses that depend on it, so a regression names the cause. The
+   teeth: the identical workload with a single permitted combiner yields exactly
+   **one** owner and zero changes. \*How many attempts found the role busy or lost
+   the acquisition CAS is reported but **not asserted\*** — those count races lost
+   to this host's scheduler, they ranged 0–280 and 0–19 over 40 runs, and an
+   earlier version of this gate asserted their sum was positive and flaked on it.
+2. **(a) Wakes ≤ grants**, and the release scenario is controlled: the parent holds
+   nearly the whole budget, four children publish requests that cannot fit and
+   **park in the kernel**, the parent waits until every one of them has actually
+   parked, and only then releases and runs ONE round. That round grants four and
+   wakes exactly four — `wakes == grants`, with real wake syscalls. This is SM-3.
+3. **(b) No waiter is ever woken without its grant**, asserted on both sides of the
+   wake and in terms of what _this code_ guarantees rather than what the kernel
+   happens to do. Publisher: `wakeCalls ≤ answersPublished` — every wake is issued
+   in the same straight-line block as the value CAS it announces, so it cannot
+   precede its answer. Waiter: of the parks this protocol really woke (the ones
+   that returned with the wait word **moved**), the number that failed to find a
+   complete, coherent payload is **zero**. A park that returns with the wait word
+   unchanged is a _spurious wakeup_, which the wait primitive is allowed to deliver
+   and which this suite tolerates elsewhere; it is counted and printed, not
+   asserted away.
+4. **(c) Every decision is identical to a single-threaded reference.** Each
+   committed round records the held-set it scanned and every decision it took;
+   the parent merges the logs by epoch — the commit CAS totally orders them — and
+   replays them through a reference admission function that keeps its **own**
+   arithmetic. It shares `ResourceVec`, `unpackVec` and saturating subtraction —
+   the vocabulary the log is written in — but re-derives the _policy_ rather than
+   calling the arbiter's fit test, which is what makes agreement a cross-check.
+   It checks that no slot is held that the reference never granted, that the two
+   held sums agree, and that every decision matches. Typical run: **92 decisions,
+   57 grants, 35 left pending, 0 mismatches**, and the same agreement in the
+   single-combiner run — so packing quality is provably unchanged by making the
+   arbiter migrate. Its **boundary**: a release is inferred from a slot's absence
+   from the round's held-set, so an _under_-counting held-set is absorbed and never
+   reported. Clause (c) proves decision identity _given_ the round's held-set, and
+   validates that set's amount but not its membership in the under-counting
+   direction; over-counting is caught, as a phantom hold.
+
+The gate's own teeth are a deliberately blind fit test (MV2's
+`CountOwnProposals = FALSE`) driven through four real parked waiters: it grants 12
+CPU slots out of 8, and the reference replay reports exactly the two decisions it
+would not have taken.
+
+Proves **SM-3** and partial **SM-4** (the arbiter exists and decides with a global
+view; _bounded waiting for large claims_ is M6's and is not attempted). Not proven
+here: SM-5/SM-6 — no process is killed and nothing is reclaimed, which is M7.
 
 ### Fast-path cost (M3)
 
 POC-local, Darwin 25.5 / arm64, one release run — read the variance warning in
 `benchmarks/bench_wait.nim` before quoting any of it:
 
-| operation | cost | syscalls |
-|---|---|---|
-| uncontended wait (word already differs) | ~2.2 ns | **0** over 5,000,000 ops |
-| uncontended wake (nobody parked) | ~2.4 ns | **0** over 5,000,000 ops |
-| forced wake syscall (the fast path bypassed) | ~430 ns | 1 per op |
-| park + wake round trip between two threads | ~5.8 µs | slow path, for scale |
+| operation                                    | cost    | syscalls                 |
+| -------------------------------------------- | ------- | ------------------------ |
+| uncontended wait (word already differs)      | ~2.2 ns | **0** over 5,000,000 ops |
+| uncontended wake (nobody parked)             | ~2.4 ns | **0** over 5,000,000 ops |
+| forced wake syscall (the fast path bypassed) | ~430 ns | 1 per op                 |
+| park + wake round trip between two threads   | ~5.8 µs | slow path, for scale     |
 
 The middle two rows are the point: skipping the wake syscall when the word records
 no waiter is ~177x cheaper than issuing it, and that is the case a naive
-implementation gets wrong on *every* release.
+implementation gets wrong on _every_ release.
 
 ### What the M4 gate proves
 
@@ -471,6 +625,7 @@ processes at **deliberately differing virtual bases** and asserts, in five phase
    ring reading over both builds and ~3.2x below the weakest falsifying control.
    12/12 release gate runs passed at each of the three load levels, and 8/8 debug
    runs idle and at 4x.
+
 3. **The idle gate** — a consumer blocks on a quiet ring for a multi-second window
    and must come back having entered the kernel exactly ONCE (zero wakeups) and
    burned no measurable CPU, while a POLLING control on the same ring burns
@@ -490,14 +645,14 @@ producer death mid-publish — kill injection is M7.
 POC-local, Darwin 25.5 / arm64, ranges across several release runs — read the
 variance warning in `benchmarks/bench_obsring.nim` before quoting any of it:
 
-| operation | cost | syscalls |
-|---|---|---|
-| append, ring has room (one producer) | ~14-34 ns | **0** |
-| append, ring FULL — the counted-drop path | ~4-11 ns | **0** |
-| append that SIGNALS (the transition) | ~443-892 ns | 1 |
-| drain, consumer side | ~10-16 ns | **0** |
-| one-way `write(2)` of the same record | ~383-402 ns | 1 |
-| socket round trip (send + ack) | ~850-915 ns | 4 |
+| operation                                 | cost        | syscalls |
+| ----------------------------------------- | ----------- | -------- |
+| append, ring has room (one producer)      | ~14-34 ns   | **0**    |
+| append, ring FULL — the counted-drop path | ~4-11 ns    | **0**    |
+| append that SIGNALS (the transition)      | ~443-892 ns | 1        |
+| drain, consumer side                      | ~10-16 ns   | **0**    |
+| one-way `write(2)` of the same record     | ~383-402 ns | 1        |
+| socket round trip (send + ack)            | ~850-915 ns | 4        |
 
 The third row against the first is the whole argument for signalling only on the
 empty-to-non-empty transition: a transition costs ~26-31x a plain append, so a
@@ -510,7 +665,7 @@ per-append cost rises from ~26-32 ns (one producer) to ~190-255 ns (three) and
 invocations on this host. Read the variance warning literally: in the two invocations
 taken while the host was busy the SINGLE-producer arm alone read 125-194 ns, so the
 contention ratios are only meaningful between arms measured in the same invocation. That rate is far beyond anything an execution stream can
-generate — one observation per *execution*, not per microsecond — so it bounds the
+generate — one observation per _execution_, not per microsecond — so it bounds the
 substrate rather than the design, and reducing it is what M5's flat combining is
 for. The M4 gate reports it and deliberately does not assert on it.
 

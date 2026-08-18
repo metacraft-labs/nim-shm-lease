@@ -100,11 +100,12 @@
 ## **enforced, not merely documented**: `claimWords` REFUSES a non-ascending index
 ## list with `csOutOfOrder`, and there is a test for it.
 
-import ./shm_lease/[hooks, packed, anchor, waitword, syscount, obsring]
+import ./shm_lease/[hooks, packed, anchor, waitword, syscount, obsring, arbiter]
 export packed
 export waitword
 export syscount
 export obsring
+export arbiter
 export hooks.SchedulePoint, hooks.scheduleHooksEnabled
 export anchor.AnchorVerdict, anchor.bootId, anchor.processStartTime,
   anchor.pidAlive, anchor.anchorVerdict, anchor.ownerAliveAnchor
@@ -157,10 +158,28 @@ const
   LhOffProbe* = 80                 ## u64 reserved; written ONLY by the
                                    ## stored-pointer negative test
   LhOffReserved1* = 88             ## u64 reserved (M7: reclamation epoch)
-  LhOffReserved2* = 96             ## u64 reserved (M5: combiner role word)
-  LhOffReserved3* = 104            ## u64 reserved (M5: combine sequence)
-  LhOffReserved4* = 112            ## u64 reserved
-  LhOffReserved5* = 120            ## u64 reserved
+  LhOffRole* = 96                  ## u64 **M5**: the COMBINER ROLE WORD,
+                                   ## `[epoch][ownerSlot][committed]`. The commit
+                                   ## flag lives INSIDE this word, so the
+                                   ## acquisition CAS and the commit CAS are the
+                                   ## same CAS on the same word — MV2's Finding 4,
+                                   ## which is a LAYOUT constraint and could not
+                                   ## have been retrofitted without a format bump.
+  LhOffCombineSeq* = 104           ## u64 **M5**: the COMBINE SEQUENCE — the
+                                   ## highest COMMITTED epoch, monotone. A ledger
+                                   ## entry is effective iff its stamp is <= this.
+  LhOffRequestsOff* = 112          ## u64 **M5**: byte OFFSET of the request-slot
+                                   ## array (0 when the segment has none)
+  LhOffRequestCount* = 120         ## u64 **M5**: number of request slots
+                                   ##
+                                   ## These four were `LhOffReserved2..5` up to
+                                   ## M5 and are the same offsets under new names;
+                                   ## MV2's model and the structures spec still
+                                   ## refer to the first two by the old names, and
+                                   ## `shm_lease/arbiter`'s docstring carries the
+                                   ## mapping. Nothing outside this file used the
+                                   ## old identifiers, so no alias is kept — one
+                                   ## name per offset.
   LeaseHeaderSize* = 128
 
 # --- one budget record: exactly 128 bytes ----------------------------------
@@ -184,9 +203,18 @@ const
   BrOffReleasedUnits* = 96         ## u64[4] atomic, released units per dimension
   BudgetRecordSize* = 128
 
-func leaseSegmentSize*(budgetCount: int): int {.inline.} =
-  ## Page-rounded byte size of a segment with `budgetCount` budget records.
-  align4k(LeaseHeaderSize + budgetCount * BudgetRecordSize)
+func leaseSegmentSize*(budgetCount: int; requestSlots: int = 0): int {.inline.} =
+  ## Page-rounded byte size of a segment with `budgetCount` budget records and
+  ## `requestSlots` M5 request slots.
+  ##
+  ## The request array is appended AFTER the budget records, and `requestSlots = 0`
+  ## reproduces M2's size exactly — so a segment created without an arbiter is
+  ## byte-for-byte the segment M2 created, and the format version does not move.
+  ## An M2-era segment read by an M5-aware process reports `LhOffRequestCount == 0`
+  ## and its arbiter view is simply unavailable, which is a graceful degrade rather
+  ## than a mismatch.
+  align4k(LeaseHeaderSize + budgetCount * BudgetRecordSize +
+    requestSlots * RequestSlotSize)
 
 type
   ClaimStatus* = enum
@@ -235,6 +263,8 @@ when shmLeaseSupported:
       budgetCount*: int
       budgetsOff: int
       boot: uint64
+      requestSlots*: int       ## M5: request slots in this segment (0 = none)
+      requestsOff: int
 
   # --- offset-addressed atomics (C11/GCC builtins) --------------------------
   template atField(base: ShmBase; offset: int; T: typedesc): ptr T =
@@ -300,15 +330,29 @@ when shmLeaseSupported:
     if off != uint64(LeaseHeaderSize): return false
     if int(off) + int(n) * BudgetRecordSize > size: return false
     if loadU64Relaxed(base, LhOffSegmentSize) != uint64(size): return false
+    # M5's request array, when the segment has one. Validated with the same
+    # suspicion as the budget array: a corrupt count or offset must make the
+    # attach FAIL rather than produce a view that indexes outside the mapping.
+    let rq = loadU64Relaxed(base, LhOffRequestCount)
+    if rq != 0:
+      if rq > uint64(MaxRequestSlots): return false
+      let rqOff = loadU64Relaxed(base, LhOffRequestsOff)
+      if rqOff != off + n * uint64(BudgetRecordSize): return false
+      if int(rqOff) + int(rq) * RequestSlotSize > size: return false
     true
 
   # --- creation: publish-before-write ---------------------------------------
 
   proc createLeaseSegment*(path: string;
-      capacities: openArray[ResourceVec]): ShmLease =
+      capacities: openArray[ResourceVec];
+      requestSlots: int = 0): ShmLease =
     ## OWNER side: create a segment whose budget word `i` starts at
     ## `capacities[i]`. `capacities[0]` is the per-machine budget
     ## (`MachineBudgetIndex`); `capacities[1 + p]` is pool `p`'s budget.
+    ##
+    ## `requestSlots > 0` additionally allocates M5's request-slot array, which is
+    ## what makes the flat-combining arbiter available on this segment. The default
+    ## is 0, so every existing caller creates the byte-identical M2 segment.
     ##
     ## PUBLISH-BEFORE-WRITE. The segment is built under a unique temp name, every
     ## field is written, the magic is release-stored LAST, and only then is the file
@@ -322,9 +366,10 @@ when shmLeaseSupported:
     result.path = path
     result.boot = bootId()
     if capacities.len == 0 or capacities.len > MaxBudgetWords: return
+    if requestSlots < 0 or requestSlots > MaxRequestSlots: return
     for c in capacities:
       if not validVec(c): return
-    let size = leaseSegmentSize(capacities.len)
+    let size = leaseSegmentSize(capacities.len, requestSlots)
     try:
       let dir = parentDir(path)
       if dir.len > 0: createDir(dir)
@@ -347,6 +392,17 @@ when shmLeaseSupported:
     storeU64Relaxed(base, LhOffMemUnitBytes, uint64(MemUnitBytes))
     storeU64Relaxed(base, LhOffDimCount, uint64(LeaseDimCount))
     storeU64Relaxed(base, LhOffProbe, 0)
+    # M5: the arbiter's two words start from a QUIESCENT state — role unowned at
+    # epoch 0, committed (so the first acquisition has nothing to repair), and the
+    # combine sequence at 0.
+    storeU64Relaxed(base, LhOffRole, roleWord(RoleNoOwner, 0, true))
+    storeU64Relaxed(base, LhOffCombineSeq, 0)
+    let requestsOff = LeaseHeaderSize + capacities.len * BudgetRecordSize
+    storeU64Relaxed(base, LhOffRequestsOff,
+      if requestSlots > 0: uint64(requestsOff) else: 0'u64)
+    storeU64Relaxed(base, LhOffRequestCount, uint64(requestSlots))
+    if requestSlots > 0:
+      initArbiterArea(base, requestsOff, requestSlots)
     for i in 0 ..< capacities.len:
       let off = LeaseHeaderSize + i * BudgetRecordSize
       let packedCap = packVec(capacities[i])
@@ -394,6 +450,8 @@ when shmLeaseSupported:
     result.fd = fd
     result.budgetCount = int(loadU64Relaxed(mapped, LhOffBudgetCount))
     result.budgetsOff = int(loadU64Relaxed(mapped, LhOffBudgetsOff))
+    result.requestSlots = int(loadU64Relaxed(mapped, LhOffRequestCount))
+    result.requestsOff = int(loadU64Relaxed(mapped, LhOffRequestsOff))
     result.available = true
 
   proc attachLeaseSegment*(path: string; wantBase: pointer = nil): ShmLease =
@@ -428,6 +486,8 @@ when shmLeaseSupported:
     result.fd = fd
     result.budgetCount = int(loadU64Relaxed(base, LhOffBudgetCount))
     result.budgetsOff = int(loadU64Relaxed(base, LhOffBudgetsOff))
+    result.requestSlots = int(loadU64Relaxed(base, LhOffRequestCount))
+    result.requestsOff = int(loadU64Relaxed(base, LhOffRequestsOff))
     result.available = true
 
   proc detach*(l: var ShmLease) =
@@ -682,6 +742,51 @@ when shmLeaseSupported:
       var two = [MachineBudgetIndex, poolBudgetIndex(poolIndex)]
       l.releaseWords(v, two)
 
+  # --- M5: binding the flat-combining arbiter to this segment ----------------
+
+  proc arbiterView*(l: ShmLease; budgetIndex: int = MachineBudgetIndex):
+      ArbiterView =
+    ## Bind `shm_lease/arbiter` to this segment's role word, combine sequence,
+    ## request array and ONE budget word. Returns an unavailable view when the
+    ## segment was created without request slots — an M2-era segment degrades, it
+    ## does not fail.
+    ##
+    ## **ONE BUDGET WORD, AND THE BOUNDARY IS DELIBERATE.** MV2 models a single
+    ## budget dimension because "what MV2 is about is whose arithmetic runs and
+    ## whether it survives a death, not how the word is packed"; the packed
+    ## multi-dimensional fit test is M2's ground and the arbiter reuses it
+    ## unchanged (`vecFits` is per dimension). Arbitrating several budget words at
+    ## once — the machine word AND a pool word, in the fixed ascending order M2
+    ## enforces — is NOT implemented and is not modelled anywhere.
+    ##
+    ## **DO NOT MIX `claimWords` AND THE ARBITER ON THE SAME BUDGET WORD.** The
+    ## arbiter treats `remaining` as a CACHE that it recomputes from the ledger
+    ## (constraint 2 of MV2's four), while `claimWords` treats it as an
+    ## accumulator it CASes down. Both are correct alone; together the recompute
+    ## would erase a concurrent claim. The authority for an arbitrated word is the
+    ## ledger, and `heldSum` is how to read it.
+    result = ArbiterView(available: false)
+    if not l.available or l.requestSlots <= 0: return
+    if budgetIndex < 0 or budgetIndex >= l.budgetCount: return
+    result.base = l.base
+    result.roleOff = LhOffRole
+    result.seqOff = LhOffCombineSeq
+    result.remainingOff = l.budgetOff(budgetIndex) + BrOffRemaining
+    result.slotsOff = l.requestsOff
+    result.slotCount = l.requestSlots
+    result.capacity = unpackVec(loadU64Relaxed(l.base,
+      l.budgetOff(budgetIndex) + BrOffCapacity))
+    result.boot = l.boot
+    result.available = true
+
+  proc arbiterClient*(l: ShmLease; slot: int;
+      budgetIndex: int = MachineBudgetIndex): ArbiterClient =
+    ## A client handle bound to `slot`, with the default bounded steal timeout.
+    ## The caller still has to `registerSlot`, which is what writes the anchor.
+    ArbiterClient(view: l.arbiterView(budgetIndex), slot: slot,
+      stealAfterNs: DefaultStealAfterNs,
+      anchorProbeAfterNs: DefaultAnchorProbeAfterNs)
+
   # --- anchoring -------------------------------------------------------------
 
   proc creatorBootId*(l: ShmLease): uint64 =
@@ -731,7 +836,12 @@ when shmLeaseSupported:
     if int(loadU64Relaxed(l.base, LhOffSegmentSize)) != size: return false
     let lo = cast[uint](l.base)
     let hi = lo + uint(size)
-    let liveEnd = l.budgetsOff + l.budgetCount * BudgetRecordSize
+    # The live part now includes M5's request slots when the segment has them: a
+    # leaked absolute pointer in a ledger entry or a want vector would be exactly
+    # as fatal at a different base as one in a budget word, so it is audited the
+    # same way rather than left outside the window the checker looks at.
+    let liveEnd = l.budgetsOff + l.budgetCount * BudgetRecordSize +
+      l.requestSlots * RequestSlotSize
     var off = 0
     while off + 8 <= liveEnd:
       let w = uint(loadU64Relaxed(l.base, off))
@@ -768,11 +878,18 @@ else:
       isOwner*: bool
       path*: string
       budgetCount*: int
+      requestSlots*: int
 
   proc createLeaseSegment*(path: string;
-      capacities: openArray[ResourceVec]): ShmLease =
+      capacities: openArray[ResourceVec];
+      requestSlots: int = 0): ShmLease =
     ShmLease(available: false, isOwner: true, path: path,
-      budgetCount: capacities.len)
+      budgetCount: capacities.len, requestSlots: requestSlots)
+  proc arbiterView*(l: ShmLease; budgetIndex: int = MachineBudgetIndex):
+      ArbiterView = ArbiterView(available: false)
+  proc arbiterClient*(l: ShmLease; slot: int;
+      budgetIndex: int = MachineBudgetIndex): ArbiterClient =
+    ArbiterClient(view: ArbiterView(available: false), slot: slot)
   proc attachLeaseSegment*(path: string; wantBase: pointer = nil): ShmLease =
     ShmLease(available: false, path: path)
   proc detach*(l: var ShmLease) = discard
