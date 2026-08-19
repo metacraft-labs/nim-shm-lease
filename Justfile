@@ -65,11 +65,18 @@ build:
     nim c {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
         -o:test-logs/test_shm_lease_hooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/build.log
+    nim c {{nim-flags}} {{src-paths}} \
+        -o:test-logs/test_shm_lease_reclaim \
+        tests/test_shm_lease_reclaim.nim 2>&1 | tee -a test-logs/build.log
+    nim c {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
+        -o:test-logs/test_shm_lease_kill_injection \
+        tests/test_shm_lease_kill_injection.nim 2>&1 | tee -a test-logs/build.log
 
 # Test: the whole suite. Deterministic — no flaky stress in `test`.
 test: test-unit test-integration test-waitword test-wait-integration \
       test-fence-shape test-obsring test-obs-integration test-arbiter \
-      test-arbiter-integration test-starvation test-hooks
+      test-arbiter-integration test-starvation test-hooks test-reclaim \
+      test-kill-injection
 
 # Unit: packed-budget arithmetic, fixed-claim-order enforcement, boot+pid+start-time
 # anchoring, over-release refusal, and the NEGATIVE controls proving the overcommit
@@ -272,6 +279,32 @@ test-hooks:
     nim c -r {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee test-logs/test-hooks.log
 
+# M7 RECLAMATION (SM-6): a client killed while holding a reservation has it
+# reclaimed, a LIVE holder never is, and a pid reused by a new process on the same
+# boot breaks neither direction. Real forks, real SIGKILLs, real `kill(pid, 0)`
+# probes; the only constructed thing is which of two REAL start times a stale
+# anchor records, which is what a pid reuse is from the reclaimer's side.
+test-reclaim:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    nim c -r {{nim-flags}} {{src-paths}} \
+        tests/test_shm_lease_reclaim.nim 2>&1 | tee test-logs/test-reclaim.log
+
+# THE M7 GATE: SIGKILL at EVERY schedule hook, including mid-combine while holding
+# the arbiter role. Loops over `SchedulePoint` itself — so a seam added later is
+# covered without editing this recipe — and for each one requires the victim to
+# have died BY SIGKILL, admission to recover inside a derived bound, the structure
+# to be intact and the dead client's capacity to come back exactly.
+# `-d:shmLeaseScheduleHooks` because the kill is injected at the hooks.
+test-kill-injection:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    nim c -r {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
+        tests/test_shm_lease_kill_injection.nim 2>&1 | \
+        tee test-logs/test-kill-injection.log
+
 # Sanitizers over the in-process thread harness (the algorithm's memory ordering;
 # TSAN does NOT cross the process boundary, and it shadows by VIRTUAL address while
 # every process maps the segment at its own base — so the cross-mapping ordering is
@@ -337,6 +370,9 @@ lint-nim:
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_arbiter.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_starvation.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_reclaim.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
+        tests/test_shm_lease_kill_injection.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/fence_shape_driver.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_wait.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
@@ -407,6 +443,16 @@ verify-tla:
     # hold; the three policy mutations below must break the first.
     nix shell nixpkgs#tlaplus --command \
         tlc -workers 4 -config shm_lease_admit_MC.cfg shm_lease_admit_MC.tla
+    echo "=== M7 RESERVATION + COMBINE + DEATH + RECLAMATION, in ONE model ==="
+    # THE MODEL M6's `:deferred:` (4) SAID WAS OWED BEFORE M7. `shm_lease_admit`
+    # has the reservation but no role, no steal and no death; `shm_lease_combine`
+    # has all of those but no release and no requeue — so a reservation
+    # interacting with a combiner that dies mid-round was checked by NEITHER.
+    # This configuration checks it, and adds M7's own two safety rules: nothing a
+    # LIVE process holds is ever taken from it, and what is genuinely consumed
+    # never exceeds the machine.
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_reclaim_MC.cfg shm_lease_reclaim_MC.tla
     echo "=== MV2 COMBINER: Finding 4's mutation vs. every NON-GHOST invariant ==="
     # GREEN ON PURPOSE, and it is what keeps Finding 4 from overstating itself.
     # `shm_lease_combine_unfenced_MC.cfg` is REQUIRED to violate `NeverBoth` on
@@ -464,6 +510,16 @@ verify-tla-negative:
         -config shm_lease_combine_pub_probe.cfg shm_lease_combine_MC.tla
     expect_violation "MV2 mutation: NO steal protocol -> admission WEDGED for every process" \
         -config shm_lease_combine_nosteal_MC.cfg shm_lease_combine_MC.tla
+    expect_violation "M7 non-vacuity: a combiner DEAD mid-round while a RESERVATION stands" \
+        -config shm_lease_reclaim_probe.cfg shm_lease_reclaim_MC.tla
+    expect_violation "M7 non-vacuity: the reaper is actually exercised" \
+        -config shm_lease_reclaim_reap_probe.cfg shm_lease_reclaim_MC.tla
+    expect_violation "M7 mutation: NO RECLAMATION -> a dead client's capacity is leaked FOREVER" \
+        -deadlock -config shm_lease_reclaim_noreclaim_MC.cfg shm_lease_reclaim_MC.tla
+    expect_violation "M7 mutation: reclamation fires on a LIVE holder -> REAL OVERCOMMIT" \
+        -config shm_lease_reclaim_live_MC.cfg shm_lease_reclaim_MC.tla
+    expect_violation "M7 mutation: no steal + a reservation standing -> admission WEDGED" \
+        -deadlock -config shm_lease_reclaim_nosteal_MC.cfg shm_lease_reclaim_MC.tla
     expect_violation "MV2 mutation: published value is a COUNTER BUMP -> DOUBLE GRANT on steal" \
         -config shm_lease_combine_counter_MC.cfg shm_lease_combine_MC.tla
     # `NoDoubleGrant`'s witness here is a RE-GRANT OF AN ALREADY-COLLECTED

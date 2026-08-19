@@ -100,12 +100,14 @@
 ## **enforced, not merely documented**: `claimWords` REFUSES a non-ascending index
 ## list with `csOutOfOrder`, and there is a test for it.
 
-import ./shm_lease/[hooks, packed, anchor, waitword, syscount, obsring, arbiter]
+import ./shm_lease/[hooks, packed, anchor, waitword, syscount, obsring, arbiter,
+  reclaim]
 export packed
 export waitword
 export syscount
 export obsring
 export arbiter
+export reclaim
 export hooks.SchedulePoint, hooks.scheduleHooksEnabled
 export anchor.AnchorVerdict, anchor.bootId, anchor.processStartTime,
   anchor.pidAlive, anchor.anchorVerdict, anchor.ownerAliveAnchor
@@ -157,7 +159,15 @@ const
   LhOffDimCount* = 72              ## u64 packed dimensions, for cross-check
   LhOffProbe* = 80                 ## u64 reserved; written ONLY by the
                                    ## stored-pointer negative test
-  LhOffReserved1* = 88             ## u64 reserved (M7: reclamation epoch)
+  LhOffReserved1* = 88             ## u64 **M7**: the RECLAMATION EPOCH — a
+                                   ## monotone count of slots reclaimed from dead
+                                   ## owners (`shm_lease/reclaim`). M2 reserved
+                                   ## this word with exactly that note and M7
+                                   ## takes it, so no offset moved, no field
+                                   ## changed size, and the format version does
+                                   ## not move: a segment on which nothing was
+                                   ## ever reclaimed is byte-for-byte the segment
+                                   ## M2 created.
   LhOffRole* = 96                  ## u64 **M5**: the COMBINER ROLE WORD,
                                    ## `[epoch][ownerSlot][committed]`. The commit
                                    ## flag lives INSIDE this word, so the
@@ -392,6 +402,10 @@ when shmLeaseSupported:
     storeU64Relaxed(base, LhOffMemUnitBytes, uint64(MemUnitBytes))
     storeU64Relaxed(base, LhOffDimCount, uint64(LeaseDimCount))
     storeU64Relaxed(base, LhOffProbe, 0)
+    # M7: the reclamation epoch starts at zero. Written explicitly rather than
+    # relied on from `ftruncate`'s zero fill, so the header's initial state is
+    # stated in one place.
+    storeU64Relaxed(base, LhOffReserved1, 0)
     # M5: the arbiter's two words start from a QUIESCENT state — role unowned at
     # epoch 0, committed (so the first acquisition has nothing to repair), and the
     # combine sequence at 0.
@@ -771,6 +785,7 @@ when shmLeaseSupported:
     result.base = l.base
     result.roleOff = LhOffRole
     result.seqOff = LhOffCombineSeq
+    result.reclaimOff = LhOffReserved1
     result.remainingOff = l.budgetOff(budgetIndex) + BrOffRemaining
     result.slotsOff = l.requestsOff
     result.slotCount = l.requestSlots

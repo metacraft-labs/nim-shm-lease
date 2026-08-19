@@ -249,6 +249,38 @@ type
     schemaVersion*: uint16
     kind*: uint16
 
+  DrainStallVerdict* = enum
+    ## **M7.** Whether the in-order drain is moving, and if not, whether it has
+    ## been stopped long enough to say so. See the detector below the accounting
+    ## section for what this can and cannot be acted on.
+    dsFlowing        ## nothing pending, or the head slot is published and
+                     ## drainable right now
+    dsPendingFresh   ## the head slot is unpublished but the drain moved recently
+                     ## — a producer mid-write looks exactly like this
+    dsStalled        ## the head slot has been unpublished, with records reserved
+                     ## behind it, for longer than the threshold
+
+  DrainStallDetector* = object
+    ## PROCESS-LOCAL, like every other timeout in this library: an interval one
+    ## process observed says nothing to another, and putting it in the segment
+    ## would invite exactly that mistake.
+    thresholdNs*: int64
+    seen*: bool
+    lastHead*: uint64
+    lastNs*: int64
+    stalls*: uint64        ## how many times this detector has reported `dsStalled`
+
+const DefaultDrainStallNs* = 250_000_000'i64
+  ## How long the head ticket must sit unpublished, with the drain not moving,
+  ## before the condition is REPORTED. Long relative to a `memcpy` of one record
+  ## and deliberately so — the cost of being late is a delayed report and the cost
+  ## of being early is a false one, and this detector's output goes into a
+  ## completeness verdict a human reads.
+
+proc newDrainStallDetector*(thresholdNs: int64 = DefaultDrainStallNs):
+    DrainStallDetector =
+  DrainStallDetector(thresholdNs: thresholdNs)
+
 # --- tag helpers (pure, available on every arm) -------------------------------
 
 proc encodeObsTag*(buf: var openArray[byte]; tag: ObsTag): bool =
@@ -289,7 +321,8 @@ when obsRingSupported:
     tryPush, tryDrainOne, PushResult, DrainResult, prPushed, prDropped,
     prOversize, prConsumerGone, drEmpty, drGot, drOverflowBuf, embeddedRingSize,
     embeddedRingHeaderSize
-  from shm_queue/segment import RingOffTail, RingOffHead, RingOffDropped
+  from shm_queue/segment import RingOffTail, RingOffHead, RingOffDropped,
+    SlotOffReady, ringSlotsBaseOffset, slotStrideFor
 
   type ShmBase = ptr UncheckedArray[byte]
     ## Deliberately NOT exported, for the reason `waitword` gives: `shm_lease`
@@ -329,6 +362,10 @@ when obsRingSupported:
     var exp = expected
     atomicCompareExchangeN(atField(base, off, uint32), addr exp, desired,
       false, ATOMIC_SEQ_CST, ATOMIC_SEQ_CST)
+  proc casU64(base: ShmBase; off: int; expected: uint64; desired: uint64): bool {.inline.} =
+    var exp = expected
+    atomicCompareExchangeN(atField(base, off, uint64), addr exp, desired,
+      false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE)
 
   proc fullFence() {.inline.} =
     ## The seq-cst fence of the Dekker pair described in this module's header. It is
@@ -570,14 +607,136 @@ when obsRingSupported:
     if not r.available: return false
     loadU32Acquire(r.base, ObsOffIdle) != 0
 
-  proc windowCompleteness*(r: ObsRing; dropsAtWindowStart: uint64): CaptureCompleteness =
+  proc windowCompleteness*(r: ObsRing; dropsAtWindowStart: uint64;
+      drainStalled: bool = false): CaptureCompleteness =
     ## OS-2, as a verdict rather than a number a caller may forget to look at. A
     ## window across which the drop counter moved is TRUNCATED, and a truncated
     ## window must never be recorded as complete: statistics over a silently
     ## thinned sample are worse than absent statistics, because they read as
     ## authoritative.
+    ##
+    ## **M7 adds the second way a window can be incomplete, and it is the one M4
+    ## left silent.** A producer killed between its ticket reservation and its
+    ## release-store publish leaves the in-order drain stopped at that ticket
+    ## (`drainStallVerdict` below). Every record behind it is then undeliverable,
+    ## and a window that contains one is truncated for a reason the DROP COUNTER
+    ## cannot see — nothing was dropped, the ring is not full, and the counter does
+    ## not move. Defaulted to `false` so every existing caller keeps its exact
+    ## previous meaning, and so the new fact has to be passed in deliberately by a
+    ## consumer that ran the detector.
     if not r.available: return ccTruncated   # unknown loss is not completeness
+    if drainStalled: return ccTruncated
     if r.droppedCount() > dropsAtWindowStart: ccTruncated else: ccComplete
+
+  # --- M7: the STRANDED-TICKET detector --------------------------------------
+  #
+  # THE DEBT THIS DISCHARGES, AND THE HALF IT CANNOT. The transport spec's
+  # kill-injection requirement is "producers killed mid-publish MUST NOT corrupt
+  # the ring or strand a partially written record", and M4 recorded it as UNMET
+  # with the mechanism spelled out: `nim-shm-queue`'s `drainBlob` returns `drEmpty`
+  # without advancing `head` when `ready != head + 1`, so a producer killed between
+  # its ticket CAS and its release-store leaves the drain stopped at that ticket
+  # forever.
+  #
+  # **THE NO-CORRUPTION HALF IS MET AND IS PROVEN HERE** (see
+  # `tests/test_shm_lease_kill_injection.nim`): a real SIGKILL in that window
+  # leaves every already-published record intact and delivers no torn record,
+  # because publication is a release-store of a ticket-tagged word and an
+  # unpublished slot simply never matches.
+  #
+  # **THE NO-STRAND HALF IS DEFERRED, WITH NAMED REASONS, AND IT IS NOT AN
+  # IMPOSSIBILITY.** Skipping the stuck ticket is safe if and only if the producer
+  # that owns it can never write again, and a ticket's owner is not recorded
+  # anywhere: the reservation and the publication are both inside
+  # `nim-shm-queue`'s `pushBlob`, with no seam between them and no owner field in
+  # its slot layout. So AS BUILT this layer has the BOUNDED TIMEOUT half of the
+  # rule M5 established for the steal detector and NOT the anchor half — and M5's
+  # finding is that the two halves buy different things. For reclamation the anchor
+  # is the safety half, so having only the timeout means this detector may REPORT
+  # and MUST NOT REPAIR: a slow producer and a dead one are indistinguishable from
+  # here, and skipping a slow one's slot would let it later overwrite a record
+  # belonging to a different ticket.
+  #
+  # WHAT IS AND IS NOT STRUCTURAL, STATED EXACTLY, because "cannot" would be an
+  # overstatement and an overstatement in a deferral is how a debt stops being
+  # paid. Two of the shortcuts really are unsound: a producer REGISTRY does not
+  # help, because the question is per-TICKET attribution rather than "is any
+  # producer alive"; and an in-PAYLOAD anchor does not help either, because
+  # `drainBlob` never zeroes a slot's blob, so an unpublished slot's bytes are
+  # indistinguishable from the previous occupant's. But the layer is not without
+  # reach: `reserveTicketWithoutPublish` below performs the ticket CAS from HERE,
+  # against `nim-shm-queue`'s exported geometry and without entering that library
+  # at all, and this module owns its own segment layout and a bumpable format
+  # version — so a per-ticket owner SIDE TABLE, written between the ticket CAS and
+  # the blob copy, is constructible at this layer.
+  #
+  # THE REASONS NOT TO DO IT HERE ARE THE ONES THAT DECIDE IT. (1) THE
+  # SINGLE-MPSC-IMPLEMENTATION INVARIANT this module opens with: the ticket-CAS
+  # reservation belongs to `nim-shm-queue`'s Layer 1 and there is deliberately ONE
+  # copy of it in the organisation. A side table that must be kept in step with a
+  # reservation the lease layer does not own would be a second, divergent half of
+  # that protocol, maintained across a library boundary and correct only while the
+  # two agree. (2) SCOPE: changing `nim-shm-queue`'s slot format was out of M7's
+  # scope. The repair therefore belongs where the reservation already lives, and
+  # the transport spec states it as a requirement on that library.
+  #
+  # What the detector therefore buys is the difference between a silent wedge and
+  # a declared one: a stalled drain becomes `ccTruncated` instead of a window that
+  # presents as complete because the drop counter never moved. The repair needs a
+  # per-ticket owner anchor in the slot, which is `nim-shm-queue`'s format.
+
+  proc headSlotReady*(r: ObsRing): bool =
+    ## Is the ticket the drain is waiting on actually published? Computed from
+    ## `nim-shm-queue`'s own exported geometry rather than a second copy of it, so
+    ## a stride change over there is a compile error here rather than a silent
+    ## misread.
+    if not r.available: return false
+    let head = loadU64Acquire(r.base, ObsRingOff + RingOffHead)
+    let tail = loadU64Acquire(r.base, ObsRingOff + RingOffTail)
+    if head >= tail: return false             # nothing reserved past head
+    let so = ObsRingOff + ringSlotsBaseOffset() +
+      int(head mod uint64(r.capacity)) * slotStrideFor(r.maxRecordLen)
+    loadU64Acquire(r.base, so + SlotOffReady) == head + 1
+
+  proc drainStallVerdict*(d: var DrainStallDetector; r: ObsRing;
+      nowNs: int64): DrainStallVerdict =
+    ## Observe the drain once. The caller supplies the clock so a test can drive
+    ## the threshold deterministically instead of sleeping through it.
+    if not r.available: return dsFlowing
+    let head = loadU64Acquire(r.base, ObsRingOff + RingOffHead)
+    let tail = loadU64Acquire(r.base, ObsRingOff + RingOffTail)
+    if head >= tail or r.headSlotReady():
+      d.seen = true
+      d.lastHead = head
+      d.lastNs = nowNs
+      return dsFlowing
+    if (not d.seen) or d.lastHead != head:
+      d.seen = true
+      d.lastHead = head
+      d.lastNs = nowNs
+      return dsPendingFresh
+    if nowNs - d.lastNs < d.thresholdNs: return dsPendingFresh
+    inc d.stalls
+    dsStalled
+
+  proc reserveTicketWithoutPublish*(r: ObsRing): bool =
+    ## **TEST SUPPORT ONLY.** Reserve a ticket and return WITHOUT publishing it —
+    ## byte-for-byte the state a producer killed between `pushBlob`'s ticket CAS
+    ## and its release-store leaves behind.
+    ##
+    ## It exists because the two steps live inside `nim-shm-queue`'s `pushBlob`
+    ## with no schedule hook between them, so a kill-injection test cannot land in
+    ## that window through the shipping API. The KILL in the test is real; this is
+    ## only how the victim is put in the right place first, and the state it
+    ## produces is the same state, checked by asserting the head slot is unready
+    ## with `pending > 0`.
+    if not r.available: return false
+    var tail = loadU64Acquire(r.base, ObsRingOff + RingOffTail)
+    while true:
+      let head = loadU64Acquire(r.base, ObsRingOff + RingOffHead)
+      if tail - head >= uint64(r.capacity): return false      # full
+      if casU64(r.base, ObsRingOff + RingOffTail, tail, tail + 1): return true
+      tail = loadU64Acquire(r.base, ObsRingOff + RingOffTail)
 
   # --- consumer identity (standalone-mode support) ---------------------------
 
@@ -816,8 +975,12 @@ else:
   proc droppedCount*(r: ObsRing): uint64 = 0
   proc pendingCount*(r: ObsRing): uint64 = 0
   proc signalCount*(r: ObsRing): uint64 = 0
-  proc windowCompleteness*(r: ObsRing;
-    dropsAtWindowStart: uint64): CaptureCompleteness = ccTruncated
+  proc windowCompleteness*(r: ObsRing; dropsAtWindowStart: uint64;
+    drainStalled: bool = false): CaptureCompleteness = ccTruncated
+  proc headSlotReady*(r: ObsRing): bool = false
+  proc drainStallVerdict*(d: var DrainStallDetector; r: ObsRing;
+    nowNs: int64): DrainStallVerdict = dsFlowing
+  proc reserveTicketWithoutPublish*(r: ObsRing): bool = false
   proc registerConsumer*(r: ObsRing) = discard
   proc deregisterConsumer*(r: ObsRing) = discard
   proc consumerVerdict*(r: ObsRing): AnchorVerdict = avNoOwner

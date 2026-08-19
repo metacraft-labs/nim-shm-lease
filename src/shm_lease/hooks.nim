@@ -94,6 +94,21 @@ type
     slpBeforeGrantPublish   ## outcome payload stored; about to CAS the waiter's
                             ## value word to the combine epoch
     slpBeforeRoleRelease    ## about to CAS the role word back to unowned
+    # --- M7: reclamation (`shm_lease/reclaim`) --------------------------------
+    #
+    # The reaper has two mutating sites and each is a place a death leaves a
+    # DIFFERENT half-state, which is why they are two seams rather than one:
+    # dying at the first leaves a dead owner's grant still held, dying between
+    # them leaves the capacity back but the slot not yet reusable. Both must be
+    # finished by the next pass, and a test drives each deliberately.
+    slpBeforeReclaimCas     ## about to CAS a dead owner's ledger entry
+                            ## `[e, grant] -> [e, released]` — the instant the
+                            ## leaked capacity comes back
+    slpBeforeReclaimEpoch   ## the capacity is back; about to bump the reclamation
+                            ## epoch. This is BEFORE the slot's payload words are
+                            ## cleared, not after — the pass bumps and THEN clears,
+                            ## deliberately, so a reaper that dies mid-slot makes
+                            ## the next pass over-count rather than under-count
 
   ScheduleHook* = proc (point: SchedulePoint) {.gcsafe, raises: [].}
 

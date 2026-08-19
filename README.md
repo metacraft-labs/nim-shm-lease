@@ -15,13 +15,14 @@ _RunQuota Observation Store & Shared-Memory Transport_ campaign —
 design authority is
 `reprobuild-specs/RunQuota-Shared-Memory-Transport.md`.
 
-## Status: M2 + M3 + M4 + M5 + M6
+## Status: M2 + M3 + M4 + M5 + M6 + M7
 
 M2 is the spec's _"§1 the fit check and claim are the easy part"_; M3 is
 _"Waiting Without Spinning"_; M4 is _"The Observation Ring"_; M5 is
 _"§3 flat combining puts the policy in shared memory"_; M6 is the anti-starvation
-_policy_ that section exists for. Nothing beyond those five. Read the scope
-honestly before building on it:
+_policy_ that section exists for; M7 is _"§4 structural crash safety"_ and
+_"§5 reservation reclamation"_. Nothing beyond those six. Read the scope honestly
+before building on it:
 
 | Campaign milestone | What it adds                                                                                          | Here?   |
 | ------------------ | ----------------------------------------------------------------------------------------------------- | ------- |
@@ -30,7 +31,7 @@ honestly before building on it:
 | **M4**             | observation ring: bounded MPSC, counted drops, non-polling consumer (rides `nim-shm-queue`'s Layer 1) | **yes** |
 | **M5**             | flat-combining arbiter: a migrating role, per-waiter grant slots, grant-then-wake                     | **yes** |
 | **M6**             | anti-starvation policy: arrival-order scan, one reservation head, bounded wait for large claims       | **yes** |
-| M7                 | kill injection, steal protocol, reservation reclamation                                               | no      |
+| **M7**             | kill injection at every hook, reservation reclamation, pid-reuse safety                               | **yes** |
 | M8                 | preemption study and go/no-go verdict                                                                 | no      |
 
 M5 added the arbiter — a global view, taken by whichever client holds the migrating
@@ -47,9 +48,20 @@ including the naive packed-CAS loop, which never admit it at all. What it does n
 buy: optimal packing. Admission is **online**, so the achievable goals are bounded
 waiting and no overcommit, and nothing more than that is claimed.
 
-The single most important thing this library is still **not**: crash-safe in
-practice. A client that dies holding a grant leaks its capacity, and no process is
-ever actually killed mid-round — that is M7.
+M7 closed the thing this library most conspicuously was not. Real processes are
+now SIGKILLed at **every** schedule hook — the loop is over the `SchedulePoint`
+enumeration itself, so a seam added later is covered without editing the test — and
+each victim dies holding a real grant and, in the combine path, the role.
+Admission recovers in a **measured 41–47 ms** against a derived 1 s bound, the
+structure is intact, and the dead client's capacity comes back exactly. What made
+it fast is measured rather than asserted: with the anchor half of the steal
+detector disabled the same kill costs **261–267 ms**, the bounded timeout.
+
+What is still **not** crash-safe: capacity taken through M2's `claimWords` path.
+That reservation is a process-local handle with no shared owner record, so a client
+killed there leaks irrecoverably. It is not the admission path — the arbiter is,
+and mixing the two on one budget word is already forbidden — but it is a real
+boundary and it is stated rather than left to be found.
 
 ## The packed budget word
 
@@ -263,6 +275,76 @@ into a live grant, and because `want` is rewritten only after the decision has b
 cleared — none of which is model-checked. See `src/shm_lease/arbiter.nim`'s
 docstring for the argument in full.
 
+### Reservation reclamation and kill injection (M7)
+
+**SM-5 and SM-6 are separate invariants, and the arbiter already satisfied the
+first.** A death never deadlocks admission and never corrupts the structure: the
+epoch fence discards a half-applied round, the steal detector recovers the role,
+and republication delivers a committed-but-unpublished answer. None of that gives
+the **capacity** back. A dead client's grant is still an effective ledger entry, so
+`heldVec` still counts it and the machine is permanently smaller — admission stays
+correct and becomes progressively useless. That is SM-6.
+
+**The per-reservation owner anchor already existed, by construction.** A grant
+lives in exactly one slot's ledger entry, `publishRequest` refuses a slot whose
+entry is still an outstanding grant, and the slot carries `ownerPid` +
+`ownerStartTime` written by `registerSlot`. So at most one grant exists per slot and
+the slot's anchor _is_ that reservation's anchor. M7 adds the reader, not the field
+— which is why M2 wrote the fields.
+
+The rule, and both ways to get it wrong:
+
+> A slot is reclaimed when its owner's anchor is **not** `avLive` **and** the slot's
+> words have been unchanged for a bounded grace.
+
+| half           | what it buys                               | mutation            | damage                                                 |
+| -------------- | ------------------------------------------ | ------------------- | ------------------------------------------------------ |
+| the **anchor** | safety — a live holder is never touched    | `rmTimeoutOnly`     | reclaims a **live** grant: real overcommit             |
+| the **grace**  | it is never judged inside a two-step write | `rmNoGrace`         | reclaims a slot mid-registration                       |
+| **start time** | pid reuse is a _different_ process         | `rmIgnoreStartTime` | a corpse reads as live: the capacity is leaked forever |
+
+All three mutations are exercised in `tests/test_shm_lease_reclaim.nim`, each on a
+board where the shipping reclaimer is required to do the right thing first.
+
+Note the division of labour is the **reverse** of the steal detector's, and the
+reversal matters. For a steal the epoch fence buys safety and the anchor buys
+progress, so an early fire costs a wasted round; for reclamation there is no fence,
+the anchor _is_ the safety, and an early fire costs an overcommit. That is why
+`rmTimeoutOnly` is a required-to-fail control rather than a tuning option.
+
+`LhOffReserved1` — the header word M2 reserved with the note "M7: reclamation
+epoch" — is now a monotone change counter of reclaimed slots, so "has anything been
+reclaimed since I last looked" is decidable by a reader that never saw the pass. No
+offset moved, no field changed size, and the format version did not move.
+
+**Reclamation deliberately does not write the role word.** A dead role holder is
+recovered by the steal detector, which is modelled, epoch-fenced and already proven
+by M5. A second writer of the role word outside the acquire/commit CAS discipline is
+precisely the shape MV2's Finding 4 rules out.
+
+**The pid-reuse test is the one the gate names, and it runs in both directions.** A
+live child's slot and a stale slot naming _the same live pid_ differ only in the
+recorded start time; the shipping reclaimer leaves the first alone (`avLive`) and
+reclaims the second (`avPidReused`), and `rmIgnoreStartTime` on the same board reads
+the corpse as live and leaks it. What is constructed is only _which_ of two **real**
+start times the stale anchor records — a natural pid reuse is unreachable in a test
+(macOS allocates pids sequentially and wraps at ~99k) and is not needed, because
+after a natural reuse the reclaimer's inputs are exactly those.
+
+**The observation ring's mid-publish kill (M4's debt), settled honestly.** A real
+SIGKILL between a producer's ticket reservation and its release-store publish
+corrupts nothing and tears no record — every record published before it is delivered
+intact and in order. It does still **stall** the in-order drain at that ticket, as
+M4 recorded. What M7 changes is that the stall is now _declared_: a stall detector
+reports it and the window becomes `ccTruncated` instead of passing as complete
+because the drop counter — which cannot see this kind of loss — never moved. The
+**repair** is not here and cannot be at this layer: skipping the stuck ticket is
+safe only if its producer can never write again, and a ticket has no owner anywhere
+— the reservation and the publication are both inside `nim-shm-queue`'s `pushBlob`,
+which has no owner field and no seam between them. This layer therefore has the
+bounded timeout and not the anchor, and M5's finding is exactly that those two
+halves buy different things.
+
 ## API sketch
 
 ```nim
@@ -356,10 +438,29 @@ runTheAction()
 doAssert c.releaseGrant()              # one CAS; the next round redistributes it
 ```
 
+```nim
+# --- M7: reclamation ----------------------------------------------------------
+
+# A REAPER (the daemon, or any client willing to pay for it out of band — never
+# from inside a round, which must stay syscall-free). One `kill(pid, 0)` per
+# OCCUPIED slot; live holders are counted and left alone.
+var reaper = newReclaimer(lease.arbiterView())
+let rep = reaper.reclaimPass()
+echo rep.reclaimed, " slots reclaimed, ", rep.freed, " capacity returned"
+for i in 0 ..< view.slotCount:
+  if rep.action[i] == saReclaimed:
+    echo "slot ", i, " reclaimed because ", rep.verdict[i]   # avOwnerGone / avPidReused / ...
+
+# A CONSUMER of the observation ring can now tell a stalled drain from a quiet one.
+var det = newDrainStallDetector()
+if det.drainStallVerdict(ring, getMonoTime().ticks) == dsStalled:
+  discard ring.windowCompleteness(dropsAtStart, drainStalled = true)   # ccTruncated
+```
+
 ## Test & benchmark
 
 ```bash
-just test           # unit + the M2, M3, M4, M5 and M6 gates + deterministic interleavings
+just test           # unit + the M2..M7 gates + deterministic interleavings + kill injection
 just bench          # POC-local claim/release, wait/wake and per-observation cost
                     # (M1/M8 own the real socket comparison)
 just soak 20        # the M2 gate harness, 20x the rounds per child
@@ -404,7 +505,8 @@ just verify-litmus    # herd7 under the C11, x86-TSO and AArch64 memory models
 ```
 
 `verification/README.md` is the record: state counts and depths for every model,
-what each invariant establishes, the coverage boundaries, and **two findings** —
+what each invariant establishes, the coverage boundaries, and the findings — among
+them **two** that paid for the tier before any code existed:
 `publishGrant` has an unstated one-outstanding-grant-per-slot precondition whose
 violation silently loses a grant, and `waitOn`'s docstring justifies its
 lost-wakeup freedom with an argument that does not hold, for a window herd7 reports
@@ -611,6 +713,59 @@ Proves **SM-4**. Its honest gap is recorded in the test: _arrival order without 
 reservation_ is not a structural control — it starves the claim on an idle host and
 admitted it in 1 of 5 runs under load — so the reservation's necessity is carried by
 the formal tier, where TLC exhibits a fair behaviour in which it never gets in.
+
+### What the M7 gate proves
+
+`tests/test_shm_lease_kill_injection.nim` (real forks, real `SIGKILL`) and
+`tests/test_shm_lease_reclaim.nim`.
+
+1. **Every schedule hook was killed at, and each victim proved it about itself.**
+   The loop is over `SchedulePoint`, and the parent requires `WIFSIGNALED` +
+   `SIGKILL` — a victim that never reached its point exits with a distinguishable
+   status and the test fails on it. 31 of 31 points, in every run.
+2. **The victim always died holding capacity.** It is granted its reservation by a
+   round the parent runs _before_ the hook is armed, so the no-leak clause is never
+   vacuous, and it then drives rounds for a request the parent published, so the
+   role-transfer, ledger, commit, sequence, budget-refresh, publication and
+   role-release points are all reached mid-round with the role held.
+3. **Admission recovered within a derived bound, every time.** Worst observed
+   recovery **44–47 ms** against an asserted 1000 ms. The bound is
+   `2 × anchorProbeAfterNs (60 ms) + one park slice (20 ms) + one round`, i.e. of
+   the order of 80 ms; the 250 ms steal timeout is never reached because the anchor
+   fires first.
+4. **…and the anchor half is what makes it fast, measured against a control.** The
+   same kill at `slpBeforeCommitCas` with the anchor probe pushed beyond the
+   timeout takes **261–267 ms** — the timeout, as designed. `fast × 2 < slow` is
+   asserted, so "the anchor is load-bearing" is a measurement rather than a comment.
+5. **No capacity permanently leaked.** After each kill the reaper hands back
+   _exactly_ the victim's vector with verdict `avOwnerGone`, the survivor releases
+   its own grant, and `remaining == capacity` **bit-for-bit** with
+   `noOvercommitAnywhere` and the stored-pointer audit clean.
+6. **A live holder is never reclaimed**, over 40 passes across a window far longer
+   than the grace — and `rmTimeoutOnly` on the identical board reclaims _both_
+   occupied slots, which is the failure direction stated as a number.
+7. **Pid reuse breaks neither direction** (above), with `rmIgnoreStartTime` leaking
+   the corpse's capacity on the same board.
+8. **The reaper is itself crash-safe.** Killed before its ledger CAS the capacity is
+   still held; killed after it the capacity is already back and the slot is not yet
+   reusable; the next pass finishes either state and the slot re-registers.
+9. **A dead client's _pending_ request does not wedge the scan.** A corpse at the
+   head of the arrival order holds capacity idle for nobody — `decidableWork` reads
+   false and a live small claim behind it is refused — and reclamation restarts
+   admission in the same round.
+
+Run counts: **22 clean runs of the kill gate** — 10 release-idle, 6 under 2× CPU
+oversubscription (32 spinners on 16 cores), 6 unoptimised — and 14 of the
+reclamation suite, no flake. Proves **SM-5** and **SM-6**.
+
+The formal half is `verification/tla/shm_lease_reclaim.tla`, which is the model M6
+recorded as owed: the reservation and the combine role **together**, with death and
+reclamation. Its three required-to-fail mutations are the three ways this could have
+been got wrong — no reaper (the capacity leaks and the large claim never fits
+again), no steal (a combiner that died mid-round while a reservation stood wedges
+admission for everybody), and a reaper that fires on a live holder (real overcommit,
+while the ledger-side invariant a naive implementation would check stays happily
+true).
 
 ### Fast-path cost (M3)
 

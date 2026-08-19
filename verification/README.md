@@ -1,10 +1,11 @@
-# nim-shm-lease — formal / weak-memory verification tier (campaign milestones MV1 + MV2)
+# nim-shm-lease — formal / weak-memory verification tier (campaign milestones MV1 + MV2, extended by M6 and M7)
 
 This directory is the **formal** verification tier for the multi-process,
 file-backed lease structures in `../src/shm_lease.nim`,
 `../src/shm_lease/packed.nim` and `../src/shm_lease/waitword.nim`. It is the
-complement to the *dynamic* verification in `../tests` (77 tests: the M2
-differing-base claim gate, the M3 block/wake gate, the M4 ring gate,
+complement to the *dynamic* verification in `../tests` (132 tests: the M2
+differing-base claim gate, the M3 block/wake gate, the M4 ring gate, the M5
+arbiter gate, the M6 anti-starvation gate, the M7 kill-injection gate,
 deterministic schedule-hook interleavings, mutation-tested assertions), and it
 exists because those tests **sample** the schedule space and cannot exhaust it.
 
@@ -53,6 +54,7 @@ Tool: `tlaplus-1.7.4` (TLC 2.19) via `nix run nixpkgs#tlaplus`. Wired as
 | **MV2** COMBINER, safety under an arbitrarily wrong steal detector | `shm_lease_combine_live_MC.cfg` | **1,325,806** | **55** | **RAN — green.** 10 invariants, safety only (see below) |
 | **MV2** COMBINER, Finding 4's mutation vs. every NON-GHOST invariant | `shm_lease_combine_unfenced_damage_MC.cfg` | **339,869** | **54** | **RAN — green.** 9 invariants + `AllSettled`. This one is green **on purpose** — see Finding 4 |
 | **M6** ADMISSION POLICY, 2 small claimers + 1 large claim, arrival order + one reservation head | `shm_lease_admit_MC.cfg` | **125** | **11** | **RAN — green.** 3 invariants + `LargeAdmitted` (SM-4) + `SmallsKeepGoing` |
+| **M7** RESERVATION + COMBINE ROLE + DEATH + RECLAMATION, in one model | `shm_lease_reclaim_MC.cfg` | **2,348** | **17** | **RAN — green.** 6 invariants + `LargeAdmitted` + `SmallsKeepGoing` + `NoLeakedCapacity` (SM-6) |
 
 **The last row is a green run on a MUTATION, and that is deliberate.**
 `shm_lease_combine_unfenced_damage_MC.cfg` runs Finding 4's `CommitFencedByRole
@@ -101,6 +103,11 @@ state-graph searches.
 | **M6** MUTATION | `shm_lease_admit_firstfit_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted` | 101 (complete) | 8 |
 | **M6** MUTATION | `shm_lease_admit_noreserve_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted` | 101 (complete) | 8 |
 | **M6** MUTATION | `shm_lease_admit_slotorder_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted` | 101 (complete) | 8 |
+| **M7** non-vacuity | `shm_lease_reclaim_probe.cfg` | `NoDeadCombinerWithHead` — a combiner really is DEAD mid-round while a RESERVATION stands, which is the state M6 recorded as reachable by neither model | 447 / 510 / 533 (run-dependent) | 7 (run-dependent) |
+| **M7** non-vacuity | `shm_lease_reclaim_reap_probe.cfg` | `NeverReaped` — the reaper is actually exercised | 129 / 121 / 146 (run-dependent) | 6 (run-dependent) |
+| **M7** MUTATION | `shm_lease_reclaim_noreclaim_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted` + `NoLeakedCapacity`: a dead claimer's grant is withheld forever (SM-6) | 1,812 (complete) | — (`-deadlock`, see below) |
+| **M7** MUTATION | `shm_lease_reclaim_live_MC.cfg` | `NoLiveReclaim` — the MIRROR IMAGE: a live holder is reclaimed, `NoOvercommitReal` follows | 106 / 89 / 136 (run-dependent) | 5 (run-dependent) |
+| **M7** MUTATION | `shm_lease_reclaim_nosteal_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted`: a combiner that died mid-round while a reservation stood wedges admission (SM-5) | 2,312 (complete) | — (`-deadlock`, see below) |
 
 **The three M6 mutations are the only rows here that break a LIVENESS property
 rather than a safety one, and they still check every safety invariant.** That is
@@ -165,6 +172,23 @@ sort of margin — `shm_lease_combine_MC_probe` was observed at 37,755, 38,647 a
 39,489 explored across three runs — while every one of the ten named invariants
 came back identical every time.
 
+**THE SAME APPLIES TO THE THREE EARLY-TERMINATING M7 ROWS, and it is recorded on
+the rows themselves rather than left to be inferred**, because this campaign has
+now corrected the same class of overstatement twice (MV1's violating rows above,
+and M4's). `shm_lease_reclaim_probe`, `shm_lease_reclaim_reap_probe` and
+`shm_lease_reclaim_live_MC` stop at the first counterexample, so with `-workers
+4` their *Explored* and *Depth* cells are **run-dependent**: two further runs
+measured **510, 121, 89** and **533, 146, 136** explored against the **447, 129,
+106** first tabled here — three runs, three different triples. What IS invariant across runs, and what a re-runner should check, is
+exactly two things per row — **that a violation is reported at all**, and **which
+named invariant** it names (`NoDeadCombinerWithHead`, `NeverReaped`,
+`NoLiveReclaim`). Both were identical on every run, and both are what `just
+verify-tla-negative` asserts. The other two M7 negative rows are **not** in this
+class: `shm_lease_reclaim_noreclaim_MC` (1,812) and `shm_lease_reclaim_nosteal_MC`
+(2,312) check temporal properties over the **complete** state graph, are marked
+`(complete)` for that reason, and reproduce byte-exactly — as do all thirteen
+green runs, including M7's own 2,348 / depth 17.
+
 **One MV2 negative row moved for a reason that is NOT drift, and it is recorded
 here so nobody mistakes it for one.** `shm_lease_combine_unfenced_MC` was
 originally tabled at 466 explored / depth 13. The model has since been corrected
@@ -188,6 +212,65 @@ of the *reported search depth* to **13 at `-workers 4` and 11 at `-workers 1`** 
 at one worker the BFS is deterministic and stops exactly at the violating level,
 so there the reported depth and the trace length coincide.
 
+### The M7 model: what it covers, and what it still does not
+
+`tla/shm_lease_reclaim.tla` exists because M6's own `:deferred:` (4) said it was
+owed *before* M7 put reclamation on the ledger entry: `shm_lease_admit` has the
+reservation, the requeue and the release but **no role, no epoch, no steal and no
+death**; `shm_lease_combine` has all of those but **no release and no requeue**. So
+a reservation interacting with a combiner that dies mid-round was checked by
+**neither**. This model checks it, and the non-vacuity probe
+(`shm_lease_reclaim_probe.cfg`) requires TLC to *exhibit* that state rather than
+leaving it to the reader to believe it is reachable.
+
+**What is new in kind is one ghost.** `using` records what each process is
+*really* consuming; `held` is what the *ledger* says it holds. Live processes keep
+the two equal by construction. Death sets `using` to zero — the OS really does take
+the memory back — and leaves `held` alone, because the ledger has no way to know:
+**that gap is the leak**. A reclamation of a *live* process clears `held` while
+`using` stands: **that gap is the overcommit**. One variable makes both directions
+checkable, and they are opposite directions of the same mistake. Note that
+`NoOvercommitLedger` — the invariant a naive implementation would check — stays
+happily true in the live-reclaim mutation, which is precisely why it is not enough.
+
+**What it deliberately does not re-model, and why that is not a gap.** The epoch,
+the commit CAS, the raise pass, the per-slot serialisation and the publication step
+are MV2's, explored there with death at every program counter over 1.3M states.
+This model takes MV2's central result as its abstraction — a round linearises at
+its commit CAS, and a half-applied round is discarded intact by the next
+acquisition — so `RoundStart` proposes, `RoundCommit` applies atomically and
+`StealRole` discards a proposal wholesale. Re-modelling MV2's internals underneath
+a fairness-checked temporal property would multiply that graph for no new
+information.
+
+**What it still does not cover, stated so nobody reads more into a green run.**
+(1) No weak memory: TLC is sequentially consistent, as everywhere in this tier.
+(2) The **grace period** is not modelled — the model's reaper acts on the anchor
+alone, so the transient two-step-write windows the grace covers
+(`registerSlot`'s state-then-anchor, `releaseGrant`'s ledger-then-state) are a
+dynamic property, proven only in the test suite — by the `rmNoGrace` control in
+`tests/test_shm_lease_reclaim.nim`, which rewinds a slot into `registerSlot`'s
+window (where the anchor reads `avNoOwner`, not `avLive`, so the anchor half has
+nothing to go on) and requires the shipping reclaimer to decline it twice and the
+mutation to reclaim it on the first pass. (3) The **anchor
+itself** is abstracted to the `alive` set: pid reuse is not modelled, and cannot
+usefully be — it is a property of the *identity scheme*, not of the protocol, and
+its proof is the dynamic pid-reuse test. (4) Only the SMALL claimers die, because
+`LargeAdmitted` is a liveness property about the large claimant and a claimant that
+has died is not waiting for anything; the large claimant dying is MV2's case.
+(5) `MaxDeaths = 1`. One death suffices to hold the role forever, to leak a grant
+forever and to park a corpse at the head of the arrival order; a second adds a
+second instance of the same three shapes and multiplies the graph.
+
+**Two of the five negatives are run with `-deadlock`, and the reason is stated
+rather than convenient.** With the recovery mechanism switched off the system
+genuinely reaches states with no successor — every live process holds all it may
+hold, nothing is decidable, nothing is enabled. That *is* the wedge, and TLC would
+report `Deadlock reached` and stop before the temporal check. Disabling the
+deadlock check lets the run continue so the reported failure **names the property
+that was lost** instead of naming a symptom. Both mutations fail either way; only
+the message differs.
+
 ### Three things that look like failures and are not
 
 **A `just verify` that seems to hang is `nix shell`, not TLC.** Every recipe pulls
@@ -210,9 +293,13 @@ identical state counts. MV2 added five green models and ten negatives for about
 26 s more of actual checking (the 1.3-million-state detector run is 10 s of it
 and the 340-thousand-state Finding 4 damage run 11 s); `just verify-tla`
 measured **1 min 18 s** end to end, `just verify-tla-negative` **26 s**, and the
-whole `just verify` — twenty-nine TLC configurations plus sixteen herd7 tests —
-**1 min 44 s**, which is *faster* than MV1's independently re-measured 6 min 44 s
-for a third as many models. That is the point about the clock: it is measuring
+whole `just verify` — then twenty-nine TLC configurations plus sixteen herd7 tests
+— **1 min 44 s**, which is *faster* than MV1's independently re-measured 6 min 44 s
+for a third as many models. M6 and M7 brought it to **forty** TLC configurations
+(13 green + 27 required-to-fail), and two consecutive end-to-end runs of that same
+set on the same host measured **2 min 1 s** and **5 min 57 s** — a factor of three
+apart, for the reason this paragraph exists. M7's six configurations contribute
+about 4 s of actual checking between them. That is the point about the clock: it is measuring
 `nix shell` and JVM startup and the state of `channels.nixos.org`, not the
 checking. Only the state counts are reproducible.
 

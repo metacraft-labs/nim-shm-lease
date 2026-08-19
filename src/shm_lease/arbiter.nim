@@ -568,6 +568,12 @@ type
     base*: ShmBase
     roleOff*: int          ## `LhOffReserved2`
     seqOff*: int           ## `LhOffReserved3`
+    reclaimOff*: int       ## **M7**: `LhOffReserved1`, the RECLAMATION EPOCH — a
+                           ## monotone count of reclaimed slots. An OFFSET like
+                           ## every other field here, and the word M2 reserved
+                           ## with the note "M7: reclamation epoch"; zero means
+                           ## the view was bound without one, which is how the
+                           ## portable arm and a hand-built view degrade.
     remainingOff*: int     ## the managed budget word (a CACHE, constraint 2)
     slotsOff*: int
     slotCount*: int

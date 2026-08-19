@@ -125,6 +125,30 @@ suite "schedule-hook coverage at every CAS and publish site":
     check ac.releaseGrant()              # the ledger CAS of a release
     al.detach()
 
+    # --- M7: reclamation's two seams ---------------------------------------
+    # The reaper has one CAS (a dead owner's grant handed back) and one counter
+    # bump (the reclamation epoch), and a death between them leaves a DIFFERENT
+    # half-state from a death before the CAS — which is why they are two seams.
+    # The slot is given a NULL anchor, which is what a client that died between
+    # `registerSlot`'s state CAS and its anchor stores leaves behind (`avNoOwner`),
+    # and two passes with a zero grace then reclaim it: the first pass starts the
+    # clock, because a slot is never judged on its first sighting.
+    let rpath = freshPath("coverage-reclaim")
+    defer: cleanup(rpath)
+    var rl = createLeaseSegment(rpath, [vec(8, 8, 8, 8)], requestSlots = 2)
+    check rl.available
+    var rcl = rl.arbiterClient(0)
+    check rcl.registerSlot(0)
+    check rcl.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    var rround: CombineRound
+    check rcl.tryCombine(rround) == cbCommitted
+    check rcl.collectAnswer() == ansGranted
+    rcl.view.writeSlotAnchor(0, 0, 0)
+    var reaper = newReclaimer(rcl.view, graceNs = 0)
+    discard reaper.reclaimPass()
+    check reaper.reclaimPass().reclaimed == 1
+    rl.detach()
+
     setScheduleHook(nil)
     # A seam nothing ever reaches is not a seam.
     for p in SchedulePoint:
