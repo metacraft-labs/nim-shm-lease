@@ -483,6 +483,36 @@ type
     wakes*: int           ## wake calls issued (a wake NEVER happens without a
                           ## publication immediately before it, in this same loop)
     wakeSyscalls*: int    ## of those, the ones that entered the kernel
+    acquiredNs*: int64    ## **M8**, THE PREEMPTION STUDY'S INSTRUMENT, and it is
+                          ## ZERO unless the library was built with
+                          ## ~-d:shmLeaseRoleTiming~. `CLOCK_MONOTONIC` read
+                          ## immediately AFTER the acquisition CAS succeeded, i.e.
+                          ## at the first instant this process is the role holder.
+                          ## Zero means "this attempt never held the role", which
+                          ## is the common case (`cbRoleBusy` / `cbLostRace` / the
+                          ## two pre-acquisition `cbNoWork` screens) and is why
+                          ## the pair below is read as a pair.
+    releasedNs*: int64    ## **M8**: `CLOCK_MONOTONIC` read at the instant the role
+                          ## stopped being held, whichever exit that was — after
+                          ## the release CAS on the two clean exits, and at the
+                          ## `cbFenced` return on the two stolen ones, where the
+                          ## role was taken rather than handed back. So
+                          ## `releasedNs - acquiredNs` is the HELD-ROLE DURATION
+                          ## the M8 gate asks for, in WALL time, and it is wall
+                          ## time on purpose: a combiner the scheduler removed
+                          ## from a core still holds the role while it is off it,
+                          ## and that is the whole risk being measured.
+    acquiredCpuNs*: int64 ## **M8**, behind a SECOND define
+                          ## (`-d:shmLeaseRoleCpuTiming`) because it is not free:
+                          ## `CLOCK_THREAD_CPUTIME_ID` across the same window.
+                          ## Wall minus CPU over the held-role window is the time
+                          ## the holder was OFF CPU while holding, which turns
+                          ## "the tail is long" into "the tail is preemption"
+                          ## rather than leaving it an inference. Measure the
+                          ## instrument's own cost before quoting a distribution
+                          ## taken with it on — `probe_preemption` does, and
+                          ## reports both arms.
+    releasedCpuNs*: int64 ## ...and the same clock at the release instant.
 
   AnswerStatus* = enum
     ansNone         ## nothing published yet for the outstanding request
@@ -674,6 +704,41 @@ when arbiterSupported:
       false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE)
 
   proc nowNs(): int64 {.inline.} = getMonoTime().ticks
+
+  # --- M8: the held-role clock, OFF BY DEFAULT -------------------------------
+  #
+  # The M8 gate asks for the ARBITER-HELD-ROLE DURATION DISTRIBUTION, which cannot
+  # be measured from outside `tryCombine`: the outside sees one call, while the
+  # window that matters runs from the acquisition CAS to the release CAS and
+  # excludes the sequence repair, the `workPending` / `decidableWork` screens and
+  # every lost race, all of which happen with the role held by SOMEBODY ELSE.
+  #
+  # It is behind a define rather than always on for the reason M4 established:
+  # DO NOT PERTURB THE THING YOU ARE MEASURING — and do not perturb the 132 tests
+  # that measure other things either. With the define off these are two empty
+  # templates and the emitted round is what it was before M8.
+  when defined(shmLeaseRoleTiming):
+    when defined(shmLeaseRoleCpuTiming):
+      # `CLOCK_THREAD_CPUTIME_ID` is not in Nim's `std/posix` on Darwin, so it is
+      # imported BY NAME from `<time.h>` rather than hard-coded to a number.
+      let ClockThreadCpuTimeId {.importc: "CLOCK_THREAD_CPUTIME_ID",
+        header: "<time.h>".}: ClockId
+
+      proc threadCpuNs(): int64 {.inline.} =
+        var ts: Timespec
+        if clock_gettime(ClockThreadCpuTimeId, ts) != 0: return 0
+        int64(ts.tv_sec) * 1_000_000_000'i64 + int64(ts.tv_nsec)
+
+    template markRoleAcquired(r: var CombineRound) =
+      when defined(shmLeaseRoleCpuTiming): r.acquiredCpuNs = threadCpuNs()
+      r.acquiredNs = nowNs()
+
+    template markRoleReleased(r: var CombineRound) =
+      r.releasedNs = nowNs()
+      when defined(shmLeaseRoleCpuTiming): r.releasedCpuNs = threadCpuNs()
+  else:
+    template markRoleAcquired(r: var CombineRound) = discard
+    template markRoleReleased(r: var CombineRound) = discard
 
   # --- geometry --------------------------------------------------------------
 
@@ -1469,6 +1534,10 @@ when arbiterSupported:
       inc c.stats.roundsLost
       r.status = cbLostRace
       return cbLostRace
+    # **M8**: the role is held from HERE. Every exit below is marked, so
+    # `releasedNs - acquiredNs` spans exactly the window in which no other client
+    # can combine.
+    markRoleAcquired(r)
     r.epoch = epoch
     r.owner = uint16(c.slot)
     r.stolen = stolen
@@ -1595,6 +1664,7 @@ when arbiterSupported:
         if not casU64(v.base, v.slotOffset(i) + RqOffLedger, entry, decided):
           # FENCED: a stealer restamped this entry, so this round no longer owns
           # the board. Abandon it — every mutation it made is already invalidated.
+          markRoleReleased(r)      # **M8**: TAKEN, not handed back
           inc c.stats.roundsFenced
           r.status = cbFenced
           return cbFenced
@@ -1647,6 +1717,7 @@ when arbiterSupported:
       var expectE = roleWord(uint16(c.slot), epoch, false)
       scheduleHook(slpBeforeRoleRelease)
       discard casU64(v.base, v.roleOff, expectE, roleWord(RoleNoOwner, epoch, false))
+      markRoleReleased(r)          # **M8**
       inc c.stats.roundsNoWork
       r.status = cbNoWork
       return cbNoWork
@@ -1658,6 +1729,7 @@ when arbiterSupported:
     var expect = roleWord(uint16(c.slot), epoch, false)
     scheduleHook(slpBeforeCommitCas)
     if not casU64(v.base, v.roleOff, expect, roleWord(uint16(c.slot), epoch, true)):
+      markRoleReleased(r)          # **M8**: TAKEN, not handed back
       inc c.stats.roundsFenced
       r.status = cbFenced
       return cbFenced
@@ -1686,6 +1758,7 @@ when arbiterSupported:
     var expect2 = roleWord(uint16(c.slot), epoch, true)
     scheduleHook(slpBeforeRoleRelease)
     discard casU64(v.base, v.roleOff, expect2, roleWord(RoleNoOwner, epoch, true))
+    markRoleReleased(r)            # **M8**
     inc c.stats.roundsCommitted
     c.stats.grantDecisions += uint64(r.grants)
     for i in 0 ..< r.decisionCount:

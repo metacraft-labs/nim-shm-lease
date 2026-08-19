@@ -24,15 +24,15 @@ _policy_ that section exists for; M7 is _"§4 structural crash safety"_ and
 _"§5 reservation reclamation"_. Nothing beyond those six. Read the scope honestly
 before building on it:
 
-| Campaign milestone | What it adds                                                                                          | Here?   |
-| ------------------ | ----------------------------------------------------------------------------------------------------- | ------- |
-| **M2**             | packed-budget multi-dimensional reservation, no overcommit, position independence                     | **yes** |
-| **M3**             | futex-class cross-process blocking (`futex` / `os_sync_wait_on_address`), per-waiter wait slots       | **yes** |
-| **M4**             | observation ring: bounded MPSC, counted drops, non-polling consumer (rides `nim-shm-queue`'s Layer 1) | **yes** |
-| **M5**             | flat-combining arbiter: a migrating role, per-waiter grant slots, grant-then-wake                     | **yes** |
-| **M6**             | anti-starvation policy: arrival-order scan, one reservation head, bounded wait for large claims       | **yes** |
-| **M7**             | kill injection at every hook, reservation reclamation, pid-reuse safety                               | **yes** |
-| M8                 | preemption study and go/no-go verdict                                                                 | no      |
+| Campaign milestone | What it adds                                                                                          | Here?                      |
+| ------------------ | ----------------------------------------------------------------------------------------------------- | -------------------------- |
+| **M2**             | packed-budget multi-dimensional reservation, no overcommit, position independence                     | **yes**                    |
+| **M3**             | futex-class cross-process blocking (`futex` / `os_sync_wait_on_address`), per-waiter wait slots       | **yes**                    |
+| **M4**             | observation ring: bounded MPSC, counted drops, non-polling consumer (rides `nim-shm-queue`'s Layer 1) | **yes**                    |
+| **M5**             | flat-combining arbiter: a migrating role, per-waiter grant slots, grant-then-wake                     | **yes**                    |
+| **M6**             | anti-starvation policy: arrival-order scan, one reservation head, bounded wait for large claims       | **yes**                    |
+| **M7**             | kill injection at every hook, reservation reclamation, pid-reuse safety                               | **yes**                    |
+| M8                 | preemption study and go/no-go verdict                                                                 | **study only, NO verdict** |
 
 M5 added the arbiter — a global view, taken by whichever client holds the migrating
 role — so the policy had somewhere to live. M6 put a policy in it, and it is two
@@ -62,6 +62,17 @@ That reservation is a process-local handle with no shared owner record, so a cli
 killed there leaks irrecoverably. It is not the admission path — the arbiter is,
 and mixing the two on one budget word is already forbidden — but it is a real
 boundary and it is stated rather than left to be found.
+
+**M8 is the row above that says "study only, NO verdict", and the wording is
+deliberate.** The campaign's M8 compares three configurations — the current socket
+daemon, this shm arbiter, and a hybrid — and publishes a recommendation. Two of the
+three do not exist in this repo: the socket-daemon arm needs RunQuota's daemon and
+the deferred M1 baseline, and the hybrid was never built. What _is_ here is the
+measurement the design spec asked for and nobody had taken — whether a client
+holding the combiner role is descheduled often enough to matter under real CPU
+oversubscription. `just preemption-study` is that measurement; see
+[The preemption study (M8, partial)](#the-preemption-study-m8-partial). **Nothing
+in it is a go/no-go, and admission stays on the socket.**
 
 ## The packed budget word
 
@@ -345,6 +356,96 @@ which has no owner field and no seam between them. This layer therefore has the
 bounded timeout and not the anchor, and M5's finding is exactly that those two
 halves buy different things.
 
+### The preemption study (M8, partial)
+
+**One arm of three, and it is not the verdict.** The campaign's M8 compares the
+socket daemon, this arbiter, and a hybrid. The socket-daemon arm needs a daemon and
+the deferred M1 baseline; the hybrid was never built. So `just preemption-study`
+measures the shm arm alone, and there is no recommendation anywhere in its output.
+
+What it does answer is the residual objection the design spec raised and never
+tested: a build client holding the combiner role is a large CPU-hungry process the
+scheduler is happy to deschedule, and flat combining's known weakness is therefore
+maximally present in this workload.
+
+**The answer, on macOS/arm64, 16 cores, six clients — 120 reps over four load
+points in four independent invocations:** preemption is **real, directly
+attributable, and not dominant at the load the milestone names**. Every range is
+min..max across all invocations; the rep count is given because it is what the
+range means.
+
+| measured oversubscription | held-role p50 | held-role p99.9 | held-role max | role occupancy | off-CPU share of held time |
+| ------------------------- | ------------- | --------------- | ------------- | -------------- | -------------------------- |
+| 1.9–2.7×                  | 2.18–2.56 µs  | 15.9–47.1 µs    | 1.7–12.3 ms   | 20.6–27.2 %    | 8.5–11.0 %                 |
+| 3.5–4.9×                  | 2.05–2.43 µs  | 15.4–27.7 µs    | 3.7–45.6 ms   | 25.2–30.6 %    | 6.4–13.9 %                 |
+| 4.8–9.1×                  | 2.05–2.43 µs  | 13.8–18.4 µs    | 3.4–63.2 ms   | 23.1–28.9 %    | 6.0–14.9 %                 |
+| 8.0–11.9×                 | 1.60–2.30 µs  | 11.8–36.9 µs    | 3.2–150.0 ms  | 15.1–24.9 %    | **4.3–42.6 %**             |
+
+(21 reps for the held-role columns, 12 for occupancy, 6 for off-CPU share.)
+
+The shape of the distribution does not change with load; only its extreme does.
+The role is idle three quarters of the time even at 78–248 k grants/second, which
+is 100–1000× what a build produces. Multiplying occupancy by off-CPU share:
+preemption costs **1.41–4.00 % of wall clock** at 1.9–9.1× oversubscription.
+
+> **Read every interval above as one significant figure — they are not bounds.**
+> Six invocations were run in total, and an independent reproduction landed
+> _outside_ the tabulated min..max at every load point, in both directions:
+> occupancy 30.8–38.7 % (against 20.6–27.2 %), off-CPU share 2.7–3.3 % (against
+> 8.5–11.0 %), preemption 0.64–2.45 % of wall clock (against 1.41–4.00 %). Each
+> invocation samples a different ambient state of a host that is never quiet, so
+> min..max over a handful of them measures the sampled spread rather than the real
+> one. **The conclusions reproduce and the intervals do not** — and the
+> reproduction came out _more_ favourable, not less. Quote this as "a few percent
+> of wall clock at 2–9× oversubscription", never as a bound.
+
+**The top row is a tenfold spread, and that is the finding rather than a defect in
+it.** Two sweeps of the identical binary at the identical requested load gave
+off-CPU shares of 4.3–19.7 % and 28.0–42.6 %. At that load preemption _can_ be the
+largest single component of held time but is not reliably so, and a single sweep
+would have supported either "negligible" or "dominant". Even the worst rep leaves
+it at 10.6 % of wall clock, and admission never degraded: 78–111 k grants/second,
+median 9.2–14.3 µs, **zero deadline misses and zero errors in all 120 reps**.
+
+**The tail is preemption as a fact, not an inference.** A second build arm reads
+`CLOCK_THREAD_CPUTIME_ID` across the same held-role window, so wall minus CPU is
+time the holder spent off a core while holding. In all twelve of its reps the
+longest held-role window and the longest off-CPU window agree to within the clock's
+noise — 141.02 ms against 141.01 ms at the extreme. The match was just as exact in the
+sweep whose shares came out small as in the one whose shares came out large: the
+tail _is_ off-CPU time, and only _how much_ tail there is varies.
+
+**Calibration first, always.** The syscall counter is checked against a known
+answer (1000 `getppid()` → exactly 1000; 10⁶ userspace iterations → exactly 0)
+before it is used to establish that `CLOCK_MONOTONIC` costs ~14 ns and **zero**
+syscalls while `CLOCK_THREAD_CPUTIME_ID` costs ~110 ns and **exactly one syscall
+per call** — which is why the CPU clock is a separate build used for the tail only.
+Clock resolution is 41 ns and sub-tick windows are counted rather than averaged in.
+A third arm builds with no timing at all, so the instrument's footprint is a
+measured difference (it is inside run-to-run variance) rather than an assurance.
+
+**How often the recovery machinery fired.** Zero role steals in **all 120 reps**
+at the 250 ms default — the worst window observed was 150.03 ms — with the anchor
+half running in 21 of 120 reps and judging every holder live; a control at a 2 ms
+threshold does produce steals, so the detector is live rather than dead. Zero
+reclamations in all 120 reps while `liveSkipped` ran 114–288 per rep: under
+sustained oversubscription the reaper never mistook a descheduled holder for a
+corpse.
+
+One caveat worth carrying, and it is a limitation of the steal detector rather
+than of the study: **the detector under-fires exactly where it would help.** A
+peer must observe the same role word twice across the timeout, and under global
+oversubscription the peers are descheduled alongside the holder, so the
+observations that would authorise a steal never happen. Measured with the
+threshold lowered to 2 ms at ~10× oversubscription: a **130.69 ms held-role window
+completed un-stolen — 65× the timeout**. Lowering the default will therefore not
+straightforwardly help. The anchor half is unaffected, since it needs one probe
+rather than two observations.
+
+Full write-up, including the load model, the host caveats and the threats to
+validity: `reprobuild-specs/RunQuota-Shm-Preemption-Study.md`. Harness:
+`benchmarks/probe_preemption.nim`.
+
 ## API sketch
 
 ```nim
@@ -463,6 +564,11 @@ if det.drainStallVerdict(ring, getMonoTime().ticks) == dsStalled:
 just test           # unit + the M2..M7 gates + deterministic interleavings + kill injection
 just bench          # POC-local claim/release, wait/wake and per-observation cost
                     # (M1/M8 own the real socket comparison)
+just preemption-study
+                    # M8, PARTIAL: held-role duration + admission latency under
+                    # injected CPU oversubscription. THE SHM ARM ONLY — no socket
+                    # daemon, no hybrid, and therefore NO VERDICT. Minutes, not
+                    # seconds, so it is opt-in like `verify`.
 just soak 20        # the M2 gate harness, 20x the rounds per child
 just test-syscalls  # EXTERNAL syscall counting for SM-2 (strace / dtruss)
 just lint           # nim check over the library and every test

@@ -378,6 +378,16 @@ lint-nim:
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/probe_fastpath.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/probe_obs_contention.nim 2>&1 | tee -a test-logs/lint-nim.log
+    # **M8**: all three arms of the preemption study, because two of them are
+    # reached only through a `-d:` flag and an arm nothing checks is an arm that
+    # rots. The plain check is the CONTROL build; the two defines are the wall and
+    # wall+cpu instruments.
+    nim check {{nim-flags}} {{src-paths}} benchmarks/probe_preemption.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} -d:shmLeaseRoleTiming \
+        benchmarks/probe_preemption.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} -d:shmLeaseRoleTiming \
+        -d:shmLeaseRoleCpuTiming \
+        benchmarks/probe_preemption.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/lint-nim.log
 
@@ -598,6 +608,44 @@ bench:
         -o:test-logs/bench_obsring benchmarks/bench_obsring.nim
     nim c -r {{nim-flags}} {{src-paths}} -d:release \
         -o:test-logs/probe_obs_contention benchmarks/probe_obs_contention.nim
+
+# ===========================================================================
+# M8 — THE PREEMPTION STUDY. Deliberately NOT part of `bench`.
+# ===========================================================================
+#
+# It takes minutes rather than seconds (it injects real CPU oversubscription and
+# holds it for a measured window per rep per load point), so it is opt-in, the
+# same way the `verify-*` tier is.
+#
+# THREE ARMS, THREE BINARIES, AND THE THIRD ARM IS THE REASON:
+#
+#   `notiming` — the library built with NO role timing at all. It is the CONTROL:
+#       its admission latency and admission rate say what the workload costs when
+#       the instrument is absent, so the instrument's own footprint is a measured
+#       difference rather than an assurance.
+#   `wall`     — `-d:shmLeaseRoleTiming`. Two `CLOCK_MONOTONIC` reads per combine
+#       round, measured at ~13 ns and ZERO syscalls. THE PRIMARY DISTRIBUTION.
+#   `cpu`      — `+ -d:shmLeaseRoleCpuTiming`. Adds two
+#       `CLOCK_THREAD_CPUTIME_ID` reads, which cost ~110 ns AND A SYSCALL EACH, so
+#       this arm perturbs the p50 badly and exists ONLY to attribute the TAIL: it
+#       is what turns "the tail is long" into "the holder was off CPU".
+#
+# Read the three together, and read the ranges rather than the point values.
+preemption-study:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    nim c {{nim-flags}} {{src-paths}} -d:release \
+        -o:test-logs/probe_preemption_notiming benchmarks/probe_preemption.nim
+    nim c {{nim-flags}} {{src-paths}} -d:release -d:shmLeaseRoleTiming \
+        -o:test-logs/probe_preemption_wall benchmarks/probe_preemption.nim
+    nim c {{nim-flags}} {{src-paths}} -d:release -d:shmLeaseRoleTiming \
+        -d:shmLeaseRoleCpuTiming \
+        -o:test-logs/probe_preemption_cpu benchmarks/probe_preemption.nim
+    for arm in wall cpu notiming; do
+      echo "########## ARM: ${arm} ##########"
+      ./test-logs/probe_preemption_${arm} 2>&1 | tee "test-logs/preemption-${arm}.log"
+    done
 
 # Single-source-of-truth version bump (version.txt is read by shm_lease.nimble).
 bump-version version:

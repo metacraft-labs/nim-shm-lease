@@ -50,8 +50,27 @@ static unsigned long long shmLeaseUnixSyscalls(void) {
   }
   return (unsigned long long)info.syscalls_unix;
 }
+
+/* **M8**: the SAME kernel record's context-switch count for this task. The
+   preemption study needs a witness for "the role holder was taken off a core"
+   that does not come from the library's own opinion, for exactly the reason the
+   syscall counter above does not: a count this code maintained would measure what
+   it believes rather than what the scheduler did. `csw` is maintained by the
+   kernel alongside `syscalls_unix`, so one `task_info` call reads either and the
+   calibration that establishes one establishes the other. */
+static unsigned long long shmLeaseContextSwitches(void) {
+  struct task_events_info info;
+  mach_msg_type_number_t cnt = TASK_EVENTS_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&info, &cnt)
+      != KERN_SUCCESS) {
+    return (unsigned long long)-1;
+  }
+  return (unsigned long long)info.csw;
+}
 """.}
   proc shmLeaseUnixSyscalls(): uint64 {.importc: "shmLeaseUnixSyscalls", nodecl.}
+  proc shmLeaseContextSwitches(): uint64 {.importc: "shmLeaseContextSwitches",
+    nodecl.}
 
   proc syscallCountAvailable*(): bool =
     shmLeaseUnixSyscalls() != high(uint64)
@@ -65,6 +84,20 @@ static unsigned long long shmLeaseUnixSyscalls(void) {
     let v = shmLeaseUnixSyscalls()
     if v == high(uint64): 0'u64 else: v
 
+  proc contextSwitchCount*(): uint64 =
+    ## **M8**: the kernel's count of context switches for this TASK — the whole
+    ## process, not one thread, which is the granularity `task_info` reports at.
+    ##
+    ## READ IT AT WINDOW GRANULARITY, NOT PER ROUND. It costs a Mach syscall, so
+    ## bracketing a two-microsecond combine round with two of these would measure
+    ## the instrument. `benchmarks/probe_preemption.nim` uses it across a whole
+    ## measured window, as the AMBIENT switch rate the per-round wall-minus-CPU
+    ## figures are read against, and calibrates it in the same batch as the
+    ## syscall counter above.
+    let v = shmLeaseContextSwitches()
+    if v == high(uint64): 0'u64 else: v
+
 else:
   proc syscallCountAvailable*(): bool = false
   proc unixSyscallCount*(): uint64 = 0'u64
+  proc contextSwitchCount*(): uint64 = 0'u64
