@@ -89,10 +89,22 @@
 ##    absorbed rather than reported — is stated at `replay` below, along with what
 ##    the reference does and does not share with the arbiter.
 ##
-## WHAT THIS GATE DOES NOT PROVE. M6's anti-starvation (a large claim is admitted
-## within a bounded wait) and M7's kill injection and reclamation are out of scope
-## and are not sampled here. A request that does not fit stays pending, which is
-## how a waiter exists at all, and nothing here bounds how long it stays that way.
+## M6 CHANGED THE POLICY UNDER THIS GATE, AND THE REFERENCE HAD TO LEARN IT.
+##    The scan is no longer ascending slot order with no reservation: it runs in
+##    ARRIVAL ORDER and the first request it cannot grant HOLDS ITS CAPACITY IDLE
+##    for the rest of the round. `referenceAdmit` re-derives both rules from the
+##    specification — it does not call into `shm_lease/arbiter` — and `replay`
+##    picks the reservation head by its OWN reading of its OWN decisions, so a
+##    mutated arbiter cannot drag it onto the same track. Two assertions were
+##    ADDED and none was weakened: `ticketInversions == 0` (the scan really is
+##    FIFO) with `slotDescents > 0` beside it (arrival order really did differ
+##    from slot order in this run, so the first assertion is not vacuous).
+##
+## WHAT THIS GATE DOES NOT PROVE. M6's bounded wait for a large claim under a
+## small-claim storm is `tests/test_shm_lease_starvation.nim`, not this file; M7's
+## kill injection and reclamation are out of scope and are not sampled here. A
+## request that does not fit still stays pending, which is how a waiter exists at
+## all, and nothing HERE bounds how long it stays that way.
 ##
 ## AND IT IS NOT A REGRESSION DETECTOR FOR THE DEFECT IT FOUND. Clause (c) caught
 ## the two-load `heldVec` read that no invariant in the suite caught — but its
@@ -147,6 +159,8 @@ type
     kind: uint16     ## `DecisionKind`, widened so the record has no padding holes
     gen: uint32
     want: uint64
+    ticket: uint64   ## **M6**: the arrival stamp the scan ordered by. The replay
+                     ## checks the ORDER as well as the outcomes — see `replay`.
 
   LoggedRound = object
     epoch: uint32
@@ -275,7 +289,7 @@ proc logRound(rep: var ChildReport; r: CombineRound) =
   for i in 0 ..< int(lr.decisionCount):
     lr.decisions[i] = LoggedDecision(slot: r.decisions[i].slot,
       kind: uint16(ord(r.decisions[i].kind)), gen: r.decisions[i].gen,
-      want: r.decisions[i].want)
+      want: r.decisions[i].want, ticket: r.decisions[i].ticket)
   rep.rounds[rep.roundCount] = lr
   inc rep.roundCount
 
@@ -691,15 +705,33 @@ type
     mismatches: int          ## decisions the reference would not have taken
     phantomHolds: int        ## a slot held that the reference never granted
     heldMismatches: int      ## the arbiter's held sum != the reference's
+    ticketInversions: int    ## **M6**: a round's decisions were NOT in ascending
+                             ## arrival order, i.e. the scan is not FIFO
+    slotDescents: int        ## **M6, the anti-vacuity companion**: adjacent
+                             ## decisions whose SLOT index went down, so arrival
+                             ## order demonstrably differed from slot order in
+                             ## this run and the check above is not vacuous
+    reservations: int        ## rounds in which the reference itself named a
+                             ## reservation head
     firstMismatch: string
     finalHeld: ResourceVec
     finalHeldSlots: set[uint8]
 
-proc referenceAdmit(capacity, held, proposed, want: ResourceVec): DecisionKind =
-  ## THE POLICY, in one function. First-fit against what is genuinely free,
-  ## counting this round's own grants — a request that cannot fit an IDLE machine
-  ## is refused outright, anything else that does not fit right now waits.
-  let free = (capacity - held) - proposed
+proc referenceAdmit(capacity, held, proposed, reserved, want: ResourceVec):
+    DecisionKind =
+  ## THE POLICY, in one function, re-derived from the specification rather than
+  ## from the implementation.
+  ##
+  ## **IT LEARNED M6'S RESERVATION, AND IT LEARNED IT INDEPENDENTLY.** Grant iff
+  ## the request fits what is genuinely free MINUS what this round has already
+  ## granted MINUS what is being HELD IDLE for the round's reservation head;
+  ## refuse outright iff it could never fit an idle machine; otherwise wait. The
+  ## head itself is chosen by the caller below, again by its own rule.
+  ##
+  ## Written out per dimension on purpose: it does not call `vecFits`,
+  ## `availableVec` or anything else in `shm_lease/arbiter`, which is what makes
+  ## agreement a cross-check rather than a tautology.
+  let free = ((capacity - held) - proposed) - reserved
   if want.cpuSlots <= free.cpuSlots and want.memUnits <= free.memUnits and
      want.procs <= free.procs and want.ioWeight <= free.ioWeight:
     return dkGrant
@@ -735,12 +767,42 @@ proc replay(rounds: seq[LoggedRound]; capacity: ResourceVec): ReplayResult =
       if result.firstMismatch.len == 0:
         result.firstMismatch = "epoch " & $rd.epoch & ": held " & $unpackVec(rd.held) &
           " but the reference says " & $held
-    # (4) EVERY DECISION IS THE ONE THE REFERENCE WOULD HAVE TAKEN.
+    # (4) EVERY DECISION IS THE ONE THE REFERENCE WOULD HAVE TAKEN — and, since
+    #     M6, IN THE ORDER THE POLICY SAYS THEY MUST BE TAKEN IN.
+    #
+    #     THE ORDER MATTERS INDEPENDENTLY OF THE OUTCOMES, and that is why it is
+    #     checked separately. The reference follows whatever order the round hands
+    #     it, so a scan that reverted to slot index would still produce decisions
+    #     the reference AGREES with — it would simply reserve for the wrong
+    #     request. `ticketInversions` is what notices; `slotDescents` beside it is
+    #     the anti-vacuity companion, because a run in which arrival order and slot
+    #     order happen to coincide proves nothing about which one was used.
     var proposed = ResourceVec()
+    var reserved = ResourceVec()
+    var reserving = false
+    var prevTicket = 0'u64
+    var prevSlot = 0'u16
     for i in 0 ..< int(rd.decisionCount):
       let d = rd.decisions[i]
+      if i > 0:
+        if d.ticket < prevTicket:
+          inc result.ticketInversions
+          if result.firstMismatch.len == 0:
+            result.firstMismatch = "epoch " & $rd.epoch & ": slot " & $d.slot &
+              " (ticket " & $d.ticket & ") was decided after ticket " & $prevTicket
+        if d.slot < prevSlot: inc result.slotDescents
+      prevTicket = d.ticket
+      prevSlot = d.slot
       let want = unpackVec(d.want)
-      let expected = referenceAdmit(capacity, held, proposed, want)
+      let expected = referenceAdmit(capacity, held, proposed, reserved, want)
+      # THE HEAD, BY THE REFERENCE'S OWN RULE: the first request THIS function
+      # would have left pending holds its capacity for the rest of the round. It
+      # keys off `expected`, never off what the arbiter actually did, so a mutated
+      # arbiter cannot drag the reference onto its own track.
+      if expected == dkPending and not reserving:
+        reserving = true
+        reserved = want
+        inc result.reservations
       let actual = DecisionKind(d.kind)
       inc result.decisions
       case actual
@@ -825,6 +887,8 @@ suite "M5 gate: the arbiter role migrates between processes":
       st.requests += rep.stats.requests
       st.grantsCollected += rep.stats.grantsCollected
       st.releases += rep.stats.releases
+      st.reservations += rep.stats.reservations
+      st.reserveBlocks += rep.stats.reserveBlocks
     check totalErrors == 0'u64
     check totalDeadline == 0'u64
     # The round log holds EVERY committed round, which is what the replay below
@@ -919,6 +983,15 @@ suite "M5 gate: the arbiter role migrates between processes":
     # requests pending, which is where a packing decision is actually taken.
     check rr.grants > 0
     check rr.pendingCount > 0
+    # --- 5b. (M6) THE SCAN RAN IN ARRIVAL ORDER ------------------------------
+    # A policy regression to slot order would leave every decision defensible and
+    # still starve, so the ORDER is asserted directly. `slotDescents > 0` is the
+    # anti-vacuity half — it says arrival order and slot order really did differ
+    # in this run — and its own teeth (the same two numbers with the ordering
+    # switched off) are in the M6 unit suite and the M6 gate, which control the
+    # publication order instead of inheriting it from six racing children.
+    check rr.ticketInversions == 0
+    check rr.slotDescents > 0
 
     # --- 6. CONSERVATION AT THE END ------------------------------------------
     # Every slot the ledger still counts as holding capacity is one the reference
@@ -945,7 +1018,11 @@ suite "M5 gate: the arbiter role migrates between processes":
       ", spurious ", st.parksSpurious, ")",
       " fast-answers=", st.fastAnswers,
       " decisions=", rr.decisions, " (grant ", rr.grants, " / pending ",
-      rr.pendingCount, ") reference mismatches=", rr.mismatches
+      rr.pendingCount, ") reference mismatches=", rr.mismatches,
+      " ticket-inversions=", rr.ticketInversions,
+      " slot-descents=", rr.slotDescents,
+      " reservations=", rr.reservations,
+      " reserve-blocks=", st.reserveBlocks
     l.detach()
 
 # ===========================================================================
@@ -1118,7 +1195,7 @@ proc toLogged(r: CombineRound): LoggedRound =
   for i in 0 ..< int(result.decisionCount):
     result.decisions[i] = LoggedDecision(slot: r.decisions[i].slot,
       kind: uint16(ord(r.decisions[i].kind)), gen: r.decisions[i].gen,
-      want: r.decisions[i].want)
+      want: r.decisions[i].want, ticket: r.decisions[i].ticket)
 
 suite "M5 gate (a): a release that frees capacity for several waiters":
   test "one round grants four parked waiters and wakes exactly four":
@@ -1177,6 +1254,7 @@ suite "M5 gate (c): packing is unchanged by making the arbiter migrate":
     check rr.mismatches == 0
     check rr.phantomHolds == 0
     check rr.heldMismatches == 0
+    check rr.ticketInversions == 0
     check rr.grants > 0
     # THE LOG-FULL GUARD, WHICH PART 1 HAD AND THIS ARM DID NOT — and its absence
     # cost a real diagnosis. A child stops combining once its round log is full, so

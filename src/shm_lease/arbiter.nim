@@ -122,11 +122,55 @@
 ## WHAT THIS MODULE IS NOT, AND THE TWO PLACES IT LEAVES THE MODEL
 ## ===========================================================================
 ##
-## **NO ANTI-STARVATION (M6).** The scan is ascending slot order, first-fit, and it
-## can starve a large request behind a stream of small ones. That is exactly the
-## defect `RunQuota-Shared-Memory-Transport.md` §2 describes and exactly what M6's
-## gate exists to fix; holding capacity idle for a pending large claim is NOT
-## implemented here and must not be read into it.
+## **ANTI-STARVATION (M6) IS IMPLEMENTED, AND IT IS TWO RULES.** The scan used to
+## be ascending slot order, first fit, which starves a large request behind a
+## stream of small ones — `RunQuota-Shared-Memory-Transport.md` §2, and the reason
+## that spec calls this a correctness gate rather than a fairness preference.
+## What replaces it:
+##
+##   * **ORDER — the scan runs in ARRIVAL ORDER**, ascending ticket
+##     (`RqOffTicket`, a monotonic-clock stamp written by `publishRequest`), slot
+##     index breaking a tie. Slot index is a placement accident; arrival is the
+##     thing a starving requester actually accumulates.
+##   * **RESERVATION — the FIRST request the scan cannot grant HOLDS ITS CAPACITY
+##     IDLE.** It becomes the round's single reservation head: every later request
+##     is decided against `capacity - held - proposed - reserved`, so a small claim
+##     arriving behind a blocked large one CANNOT take the capacity the large one
+##     is waiting for. This is the "hold capacity idle for a large pending claim
+##     instead of spending it on a small one" the transport spec §2 asks for.
+##
+## **AT MOST ONE HEAD PER ROUND, AND THAT BOUND IS THE WHOLE ANTI-DEADLOCK
+## ARGUMENT.** Reserving for every blocked request would let the reservations sum
+## past the capacity and stop admission dead — the cure becoming a worse disease.
+## One head means the reserved amount is at most one request's `want`, and the
+## capacity beyond it stays available to everybody: measured in the M6 gate as
+## small claims continuing to be granted while the head waits.
+##
+## WHY THIS BOUNDS THE WAIT, stated as the argument it is rather than as a claim.
+## Let R be the head at time t0. From t0 on, every grant satisfies
+## `want <= capacity - held - reserved`, so no grant made after t0 pushes `held`
+## above `capacity - want(R)`. `held` otherwise only DECREASES (a release). So
+## `held` is monotonically driven to `<= capacity - want(R)`, at which point R
+## fits and is granted — R is scanned before every request that arrived after it,
+## so no younger request can take that capacity first. The wait is therefore
+## bounded by the time the grants outstanding at t0 take to be released, plus one
+## round, plus the bounded set of requests OLDER than R. Admission is ONLINE —
+## future arrivals are unknown — so optimal packing is unattainable in principle;
+## bounded waiting and no overcommit are the achievable goals and are all that is
+## claimed here.
+##
+## THE IDLE HOLD IS BOUNDED BY CONSTRUCTION, WHICH IS THE OTHER HALF OF THE GATE.
+## A reservation exists only while its head does not fit `capacity - held`, i.e.
+## only while another slot's LIVE grant covers the capacity it needs. It ends when
+## the head is granted. A policy that reserved permanently would be its own
+## failure mode, so the gate asserts the head is admitted within a bounded, stated
+## time and that small-claim throughput RECOVERS afterwards.
+##
+## THREE NEGATIVE CONTROLS, one per mechanism plus the pair (see
+## `ArbiterMutation`): `amFirstFit` is M5's policy exactly, `amSlotOrder` keeps the
+## reservation but hands it to the wrong request, and `amNoReserve` keeps arrival
+## order but holds nothing idle. All three STARVE the large claim in the M6 gate,
+## structurally rather than probabilistically.
 ##
 ## **NO RECLAMATION (M7).** A client that dies holding a grant leaves the grant in
 ## the ledger and its capacity taken. MV2 excludes reclamation for the same reason.
@@ -269,7 +313,32 @@ const
                          ## the waiter observed
   RqOffOwnerPid* = 40    ## u64 — anchor: the client that registered this slot
   RqOffOwnerStart* = 48  ## u64 — anchor: its start time (defeats pid reuse)
-  RqOffReserved* = 56    ## u64 — reserved (M7: reservation deadline)
+  RqOffTicket* = 56      ## u64 — **M6**: the ARRIVAL TICKET, a monotonic-clock
+                         ## stamp written by `publishRequest` BEFORE the state is
+                         ## released. It is what makes the scan order arrival
+                         ## order rather than slot order, and therefore what makes
+                         ## the reservation head the OLDEST blocked request.
+                         ##
+                         ## This word was `RqOffReserved`, annotated "M7:
+                         ## reservation deadline". M6 takes it, and M7 is not left
+                         ## short: a deadline is `ticket + policy timeout`, so the
+                         ## arrival stamp is the better half of what that note
+                         ## wanted. No offset moved and no field changed size, so
+                         ## a segment created without request slots is still
+                         ## byte-for-byte M2's and the format version does not
+                         ## move.
+                         ##
+                         ## CLOCK, NOT COUNTER, and that is a choice with a reason:
+                         ## a global ticket counter needs a header word (the
+                         ## 128-byte header has none free) and adds a contended
+                         ## fetch-add to every publish. `CLOCK_MONOTONIC` is
+                         ## system-wide on both supported platforms, so stamps
+                         ## from different processes are comparable, and the tie
+                         ## break on slot index makes an exact collision
+                         ## deterministic rather than merely unlikely.
+  RqOffReserved* = RqOffTicket
+                         ## DEPRECATED alias for the word above, kept so a reader
+                         ## coming from M5's layout notes lands on the rename.
   RequestSlotSize* = 64
 
   RoleNoOwner* = 0xFFFF'u16
@@ -326,6 +395,31 @@ type
     amNoSerialise       ## let the raise pass restamp EFFECTIVE entries too.
                         ## `SerialisePerSlot = FALSE`,
                         ## `shm_lease_combine_noserial_MC.cfg` -> `NoDoubleGrant`.
+    amFirstFit          ## **M6 CONTROL — M5's POLICY, EXACTLY.** Ascending slot
+                        ## order, first fit, no reservation. This is the "naive
+                        ## first-come-if-it-fits" admission
+                        ## `RunQuota-Shared-Memory-Transport.md` §2 says starves
+                        ## large claims, and the M6 gate requires it to do so.
+                        ## `Reserve = FALSE` + `ArrivalOrder = FALSE`,
+                        ## `shm_lease_admit_firstfit_MC.cfg` -> `LargeAdmitted`.
+    amSlotOrder         ## **M6 CONTROL — the RESERVATION, given to the WRONG
+                        ## REQUEST.** The reservation stays on but the scan runs
+                        ## in slot order, so the head is the lowest-indexed
+                        ## blocked request rather than the oldest. It isolates the
+                        ## ARRIVAL ORDER as load-bearing: a large claim at a high
+                        ## slot index is starved even though capacity is being
+                        ## held idle — for somebody else.
+                        ## `ArrivalOrder = FALSE`,
+                        ## `shm_lease_admit_slotorder_MC.cfg` -> `LargeAdmitted`.
+    amNoReserve         ## **M6 CONTROL — ARRIVAL ORDER WITHOUT THE RESERVATION.**
+                        ## The scan is oldest-first but nothing is held idle, so
+                        ## capacity freed by a release is spent on whichever
+                        ## request fits. It isolates the RESERVATION as
+                        ## load-bearing, and it is the more interesting of the
+                        ## three: FIFO ordering alone looks like an anti-starvation
+                        ## policy and is not one.
+                        ## `Reserve = FALSE`,
+                        ## `shm_lease_admit_noreserve_MC.cfg` -> `LargeAdmitted`.
 
   ArbiterMutations* = set[ArbiterMutation]
 
@@ -354,6 +448,13 @@ type
     gen*: uint32          ## which request in that slot's history this was
     want*: uint64         ## packed
     kind*: DecisionKind
+    ticket*: uint64       ## **M6**: the arrival stamp this decision was ordered
+                          ## by. Recorded so the gate's reference implementation
+                          ## can check the ORDER as well as the outcomes — a scan
+                          ## that silently reverted to slot order would still make
+                          ## individually defensible decisions.
+    reserved*: bool       ## **M6**: this decision left the request pending AND
+                          ## made it the round's reservation head.
 
   CombineRound* = object
     ## The outcome record of one combine attempt. A plain object with fixed-size
@@ -369,6 +470,15 @@ type
     decisions*: array[MaxRequestSlots, DecisionRec]
     decisionCount*: int
     grants*: int          ## decisions of kind `dkGrant` in this round
+    reserveSlot*: int     ## **M6**: the slot this round held capacity idle for,
+                          ## or -1. THE IDLE HOLD, per round.
+    reservedVec*: ResourceVec  ## ...and how much was held idle for it.
+    reserveBlocked*: int  ## **M6**: decisions this round left pending that WOULD
+                          ## HAVE FIT the capacity that was genuinely free, and
+                          ## were refused solely because the head's reservation
+                          ## covered it. This is the idle hold OBSERVED rather
+                          ## than inferred: zero of these means the reservation
+                          ## never cost anything, i.e. it was never tested.
     published*: int       ## answers whose value word this round actually moved
     wakes*: int           ## wake calls issued (a wake NEVER happens without a
                           ## publication immediately before it, in this same loop)
@@ -408,6 +518,13 @@ type
                                ## adding a grant here, which is precisely how
                                ## `amCounterPublish` shows up as `wakes > grants`.
     refuseDecisions*: uint64   ## permanent refusals decided, likewise
+    reservations*: uint64      ## **M6**: rounds that named a reservation head,
+                               ## i.e. rounds in which capacity was HELD IDLE for
+                               ## a request that did not fit.
+    reserveBlocks*: uint64     ## **M6**: the cost of those reservations, counted
+                               ## — decisions left pending that would otherwise
+                               ## have been granted. A policy that never pays this
+                               ## never reserves anything.
     grantsPublished*: uint64   ## grants whose value word this process moved
     answersPublished*: uint64  ## answers (grant or refusal) it moved
     wakeCalls*: uint64         ## wake calls issued. SM-3 is `wakes <= grants`.
@@ -572,7 +689,7 @@ when arbiterSupported:
       storeU64Relaxed(base, off + RqOffOutcome, ledgerWord(0, ldNone))
       storeU64Relaxed(base, off + RqOffOwnerPid, 0)
       storeU64Relaxed(base, off + RqOffOwnerStart, 0)
-      storeU64Relaxed(base, off + RqOffReserved, 0)
+      storeU64Relaxed(base, off + RqOffTicket, 0)
 
   # --- reading the shared words ----------------------------------------------
 
@@ -614,6 +731,13 @@ when arbiterSupported:
 
   proc wantAt*(v: ArbiterView; slot: int): uint64 {.inline.} =
     loadU64Acquire(v.base, v.slotOffset(slot) + RqOffWant)
+
+  proc ticketAt*(v: ArbiterView; slot: int): uint64 {.inline.} =
+    ## **M6**: the arrival stamp of the request currently published in this slot.
+    ## Written before the state's release-store, so a combiner that acquire-loads
+    ## `rqPending` necessarily sees the ticket that goes with it — the same
+    ## publish-before-write rule `want` follows.
+    loadU64Acquire(v.base, v.slotOffset(slot) + RqOffTicket)
 
   proc stateAt*(v: ArbiterView; slot: int): uint64 {.inline.} =
     loadU64Acquire(v.base, v.slotOffset(slot) + RqOffState)
@@ -829,6 +953,18 @@ when arbiterSupported:
     inc c.gen
     c.baseVal = valueAt(c.view, c.slot)
     storeU64Relaxed(c.view.base, off + RqOffWant, packVec(want))
+    # **M6 — THE ARRIVAL TICKET.** Written here, with `want`, under the same
+    # publish-before-write discipline: both are plain relaxed stores that PRECEDE
+    # the release-store of the state, so a combiner that acquire-loads `rqPending`
+    # sees the pair that belongs to it. A FRESH stamp per request is the fairness
+    # rule, not an implementation detail — a client that is granted, releases and
+    # asks again goes to the BACK of the arrival order, which is what stops one
+    # busy client from holding a permanent claim on the head position.
+    #
+    # It costs a clock read and NOT a kernel entry: `CLOCK_MONOTONIC` is served
+    # from the commpage on macOS and the vDSO on Linux, and the unit suite asserts
+    # that with the kernel's own syscall counter rather than asserting it here.
+    storeU64Relaxed(c.view.base, off + RqOffTicket, uint64(nowNs()))
     storeU64Release(c.view.base, off + RqOffState,
       stateWord(rqPending, c.gen, c.baseVal))
     inc c.stats.requests
@@ -1042,7 +1178,54 @@ when arbiterSupported:
         return true
     false
 
-  proc decidableWork*(v: ArbiterView): bool =
+  # --- M6: the admission POLICY, in the two places that must agree -----------
+
+  func usesArrivalOrder*(m: ArbiterMutations): bool {.inline.} =
+    ## **M6 rule 1.** Off under the two controls that revert the ordering.
+    amFirstFit notin m and amSlotOrder notin m
+
+  func usesReservation*(m: ArbiterMutations): bool {.inline.} =
+    ## **M6 rule 2.** Off under the two controls that hold nothing idle.
+    amFirstFit notin m and amNoReserve notin m
+
+  proc buildScanOrder(v: ArbiterView; order: var array[MaxRequestSlots, uint16];
+      keys: var array[MaxRequestSlots, uint64]; arrivalOrder: bool): int =
+    ## Collect the slots a round would consider and put them in SCAN ORDER.
+    ##
+    ## Allocation-free and bounded, which the milestone requires of everything a
+    ## round does: two fixed arrays of `MaxRequestSlots`, and an insertion sort
+    ## over at most 64 entries. An insertion sort rather than anything cleverer
+    ## because 64 is the bound and "no allocation, no recursion" is the property
+    ## that matters here, not the asymptotics.
+    ##
+    ## The sort is STABLE (the shift condition is a strict `>`) and slots are
+    ## offered to it in ascending index order, so equal keys keep ascending slot
+    ## order. That is what makes an exact ticket collision — two processes
+    ## stamping the same nanosecond — DETERMINISTIC rather than merely unlikely,
+    ## which matters because the gate's reference implementation has to predict
+    ## the same order.
+    ##
+    ## `arrivalOrder = false` gives every slot the key 0, so the stable sort
+    ## leaves them in ascending slot index: M5's order, reproduced by the
+    ## `amFirstFit` / `amSlotOrder` controls through THIS code path rather than
+    ## through a second copy of the loop that could drift from it.
+    var n = 0
+    for i in 0 ..< v.slotCount:
+      let st = stateAt(v, i)
+      if stateOf(st) != rqPending: continue
+      if valueAt(v, i) != stateBaseVal(st): continue   # already answered
+      let key = if arrivalOrder: ticketAt(v, i) else: 0'u64
+      var j = n
+      while j > 0 and keys[j - 1] > key:
+        order[j] = order[j - 1]
+        keys[j] = keys[j - 1]
+        dec j
+      order[j] = uint16(i)
+      keys[j] = key
+      inc n
+    n
+
+  proc decidableWork*(v: ArbiterView; mutations: ArbiterMutations = {}): bool =
     ## "IS THERE ANYTHING A ROUND COULD ACTUALLY GET DONE RIGHT NOW" — decide OR
     ## publish. Not the same question as `workPending`, and DEPARTURE 1 is why: a
     ## request that does not
@@ -1054,17 +1237,32 @@ when arbiterSupported:
     ## measurement, and for the gate failure it caused).
     ##
     ## **IT IS EXACT, NOT A HEURISTIC, and that matters — an over-eager answer
-    ## would put the empty rounds back and a shy one would drop real work.** The
-    ## scan is first fit in ascending slot order starting from `proposed = 0`, so:
-    ##   * if ANY pending request fits `capacity - held`, the LOWEST-INDEXED such
-    ##     request is reached with `proposed` still small enough to fit it, and
-    ##     the round grants at least one; and
-    ##   * a request that cannot fit `capacity` at all is refused unconditionally.
-    ## So the two DECISION clauses are true exactly when the round would stamp at
-    ## least one ledger entry — and the PUBLICATION clause below is exact in the
-    ## same sense, because it tests the identical condition `publishOne` tests
-    ## before it moves a word. Taken together: true exactly when the round would
-    ## stamp a ledger entry or move a value word.
+    ## would put the empty rounds back and a shy one would drop real work.** It is
+    ## exact because it RUNS THE SAME POLICY the scan runs, over the same slots in
+    ## the same order, and stops at the first decision the scan would stamp:
+    ##   * the scan order is `buildScanOrder`, the identical procedure;
+    ##   * the fit test is `capacity - held - proposed - reserved`, and since this
+    ##     simulation returns at the FIRST grantable request, `proposed` is still
+    ##     zero there — so the two agree without this loop having to model the
+    ##     accumulation;
+    ##   * the reservation head is chosen by the identical rule, which is what
+    ##     makes the answer exact UNDER M6's POLICY: a request that fits
+    ##     `capacity - held` but sits behind the head is NOT decidable work, and a
+    ##     predicate that said otherwise would take the role, stamp nothing, and
+    ##     reintroduce the churn `EpochBoundNotBinding` rules out — this time
+    ##     without even the empty commit to show for it, since step 4b abandons
+    ##     the round at the same epoch;
+    ##   * a request that cannot fit `capacity` at all is refused unconditionally,
+    ##     ahead of any reservation, so a permanently unfittable request is never
+    ##     hidden behind a head.
+    ## The PUBLICATION clause is exact in its own sense: it tests the identical
+    ## condition `publishOne` tests before it moves a word. Taken together: true
+    ## exactly when the round would stamp a ledger entry or move a value word.
+    ##
+    ## `tests/test_shm_lease_arbiter.nim` asserts that equivalence EXECUTABLY,
+    ## over a sweep of boards, rather than leaving it to this paragraph — the two
+    ## drifting apart is the exact shape of the defect M5's verification found
+    ## twice.
     ##
     ## **DECIDABLE INCLUDES "ALREADY DECIDED BUT NOT YET PUBLISHED", AND LEAVING
     ## THAT OUT WAS A DEADLOCK.** An earlier version of this predicate asked only
@@ -1097,8 +1295,13 @@ when arbiterSupported:
     ## process or by any other.
     if not v.available: return false
     var mask: uint64
-    let free = v.capacity - v.heldVec(mask)
+    let held = v.heldVec(mask)
+    let free = v.capacity - held
     let cseq = v.combineSeq()
+
+    # THE PUBLICATION CLAUSE, first and independent of the policy: an effective
+    # decision whose answer has not reached its value word is work whatever the
+    # ordering rule says, and it is the clause whose absence deadlocked M5.
     for i in 0 ..< v.slotCount:
       let st = stateAt(v, i)
       if stateOf(st) != rqPending: continue
@@ -1108,9 +1311,23 @@ when arbiterSupported:
       if (dec == ldGrant or dec == ldRefuse) and ledgerEpoch(entry) <= cseq and
           valueAt(v, i) != ledgerEpoch(entry):
         return true                                    # DECIDED, UNPUBLISHED
+
+    # THE DECISION CLAUSES, under M6's policy: the same order, the same fit test,
+    # the same single reservation head.
+    var order: array[MaxRequestSlots, uint16]
+    var keys: array[MaxRequestSlots, uint64]
+    let n = buildScanOrder(v, order, keys, usesArrivalOrder(mutations))
+    let reserve = usesReservation(mutations)
+    var reserved = ResourceVec()
+    var reserving = false
+    for k in 0 ..< n:
+      let i = int(order[k])
       let want = unpackVec(wantAt(v, i))
-      if vecFits(want, free): return true              # grantable now
       if not vecFits(want, v.capacity): return true    # refusable, permanently
+      if vecFits(want, free - reserved): return true   # grantable now
+      if reserve and not reserving:
+        reserving = true
+        reserved = want                                # THE IDLE HOLD begins here
     false
 
   # --- THE ROUND -------------------------------------------------------------
@@ -1188,7 +1405,9 @@ when arbiterSupported:
     ## does not get the role returns `cbRoleBusy` and the caller runs other work
     ## (SM-8). Allocation-free and, apart from the wake of a waiter it has just
     ## answered, syscall-free.
-    r = CombineRound(status: cbUnavailable)
+    # `reserveSlot` is -1 = "this round held nothing idle"; the default zero
+    # value would name slot 0, which is a real slot.
+    r = CombineRound(status: cbUnavailable, reserveSlot: -1)
     if not c.view.available: return cbUnavailable
     let v = c.view
 
@@ -1226,7 +1445,7 @@ when arbiterSupported:
       inc c.stats.roundsNoWork
       r.status = cbNoWork
       return cbNoWork
-    if not v.decidableWork():
+    if not v.decidableWork(c.mutations):
       # NOTHING THIS ROUND COULD DECIDE. Requests are pending, but every one of
       # them needs capacity that is currently held and none of them is refusable,
       # so a round would raise the ledger, decide nothing, commit and advance the
@@ -1271,13 +1490,28 @@ when arbiterSupported:
         ledgerWord(epoch, ldNone))
 
     # 4. THE SCAN. Decide against the EFFECTIVE ledger plus this round's own
-    #    proposals, in ascending slot order — bulk admission, one round settles
-    #    what it can. First-fit by slot index, deliberately: anti-starvation is M6
-    #    and must not be read into this loop.
+    #    proposals, in ARRIVAL ORDER — bulk admission, one round settles what it
+    #    can.
+    #
+    #    **M6 LIVES IN THIS LOOP, AND IT IS TWO RULES** (module docstring for the
+    #    bounded-wait argument): the order is the arrival ticket rather than the
+    #    slot index, and the FIRST request the scan cannot grant becomes the
+    #    round's single RESERVATION HEAD, whose `want` is withheld from every
+    #    request decided after it. That is capacity HELD IDLE for a pending large
+    #    claim instead of spent on a small one that arrived later, which is what
+    #    `RunQuota-Shared-Memory-Transport.md` §2 requires and what M5's
+    #    slot-ordered first fit could not do.
     var mask: uint64
     let held = v.heldVec(mask)
     r.heldMask = mask
     r.held = held
+    var order: array[MaxRequestSlots, uint16]
+    var keys: array[MaxRequestSlots, uint64]
+    let arrivalOrder = usesArrivalOrder(c.mutations)
+    let scanCount = buildScanOrder(v, order, keys, arrivalOrder)
+    let reserve = usesReservation(c.mutations)
+    var reserved = ResourceVec()
+    var reserving = false
     var proposed = ResourceVec()
     var stamped = 0        ## ledger entries this round actually decided —
                            ## grants plus permanent refusals. A round that stamps
@@ -1289,7 +1523,8 @@ when arbiterSupported:
     var incremental =
       if amIncrementalBudget in c.mutations: v.budgetCache()
       else: v.capacity - held
-    for i in 0 ..< v.slotCount:
+    for k in 0 ..< scanCount:
+      let i = int(order[k])
       let st = stateAt(v, i)
       if stateOf(st) != rqPending: continue
       var entry = ledgerAt(v, i)
@@ -1301,10 +1536,15 @@ when arbiterSupported:
       # bug in a bulk-admission round, because each decision is individually
       # correct against a real state and their SUM overcommits
       # (`shm_lease_combine_fit_MC.cfg`).
-      let avail =
+      let availFree =
         if amIncrementalBudget in c.mutations: incremental
         elif amBlindFit in c.mutations: v.capacity - held
         else: availableVec(v.capacity, held, proposed)
+      # ...and THEN the reservation is taken off it. Two variables rather than one
+      # because the difference between them is exactly the IDLE HOLD, and it is
+      # counted below rather than inferred: `availFree` is what is genuinely free,
+      # `avail` is what this request is allowed to have.
+      let avail = if reserve: availFree - reserved else: availFree
       var kind: DecisionKind
       if vecFits(want, avail):
         kind = dkGrant
@@ -1312,6 +1552,36 @@ when arbiterSupported:
         kind = dkRefuse          # can NEVER fit: a permanent refusal is an answer
       else:
         kind = dkPending         # DEPARTURE 1: left pending for a later round
+      var becameHead = false
+      if kind == dkPending and reserve:
+        if not reserving:
+          # **THE RESERVATION HEAD.** The first request this round could not
+          # grant holds its capacity idle for the rest of the scan. ONE head, not
+          # one per blocked request: reservations that summed past the capacity
+          # would stop admission dead, which is the cure becoming the disease.
+          reserving = true
+          becameHead = true
+          reserved = want
+          r.reserveSlot = i
+          r.reservedVec = want
+          inc c.stats.reservations
+        elif vecFits(want, availFree):
+          # THE COST OF THE RESERVATION, COUNTED. This request fitted the capacity
+          # that was genuinely free and was refused anyway, because the head is
+          # waiting for it.
+          #
+          # **REPORTED RATHER THAN ASSERTED, AND THE REASON IS AN INTERACTION
+          # WORTH KNOWING.** On a board whose only pending work is a reserved head
+          # and the requests it is blocking, `decidableWork` declines the role
+          # BEFORE a round runs — so the arbiter does not even burn an acquisition
+          # while it holds capacity idle, and this counter stays near zero by
+          # design rather than by absence of the behaviour. The M6 gate therefore
+          # observes the idle hold from OUTSIDE, by sampling the board for states
+          # in which the head is waiting, a small claim is waiting, and capacity is
+          # free and not being given out. The deterministic assertion on this
+          # counter lives in a unit test that gives the round other work to do.
+          inc r.reserveBlocked
+          inc c.stats.reserveBlocks
       if kind != dkPending:
         scheduleHook(slpBeforeLedgerCas)
         let decided = ledgerWord(epoch,
@@ -1330,7 +1600,15 @@ when arbiterSupported:
       if r.decisionCount < MaxRequestSlots:
         r.decisions[r.decisionCount] =
           DecisionRec(slot: uint16(i), gen: stateGen(st),
-                      want: packVec(want), kind: kind)
+                      want: packVec(want), kind: kind,
+                      # The key the scan actually ordered by when that key IS the
+                      # ticket, so the reference can check the ORDER and not only
+                      # the outcomes. Under the two order-reverting controls the
+                      # key is 0 by construction, and recording the slot's real
+                      # ticket there is what lets the same reference SEE that the
+                      # order was wrong.
+                      ticket: (if arrivalOrder: keys[k] else: ticketAt(v, i)),
+                      reserved: becameHead)
         inc r.decisionCount
 
     # 4b. AN EMPTY ROUND DOES NOT COMMIT. `decidableWork` above makes this the
@@ -1437,6 +1715,7 @@ else:
   proc storeCombineSeq*(v: ArbiterView; e: uint32) = discard
   proc ledgerAt*(v: ArbiterView; slot: int): uint64 = 0
   proc wantAt*(v: ArbiterView; slot: int): uint64 = 0
+  proc ticketAt*(v: ArbiterView; slot: int): uint64 = 0
   proc stateAt*(v: ArbiterView; slot: int): uint64 = 0
   proc valueAt*(v: ArbiterView; slot: int): uint32 = 0
   proc outcomeAt*(v: ArbiterView; slot: int): uint64 = 0
@@ -1463,10 +1742,15 @@ else:
   proc ownerAnchorVerdict*(v: ArbiterView; slot: int): AnchorVerdict = avNoOwner
   proc mayStealRole*(c: var ArbiterClient; observed: uint64): bool = false
   proc workPending*(v: ArbiterView): bool = false
-  proc decidableWork*(v: ArbiterView): bool = false
+  proc decidableWork*(v: ArbiterView; mutations: ArbiterMutations = {}): bool =
+    false
+  func usesArrivalOrder*(m: ArbiterMutations): bool =
+    amFirstFit notin m and amSlotOrder notin m
+  func usesReservation*(m: ArbiterMutations): bool =
+    amFirstFit notin m and amNoReserve notin m
   proc refreshBudgetCache*(v: ArbiterView): ResourceVec {.discardable.} =
     ResourceVec()
   proc tryCombine*(c: var ArbiterClient; r: var CombineRound): CombineStatus =
-    r = CombineRound(status: cbUnavailable); cbUnavailable
+    r = CombineRound(status: cbUnavailable, reserveSlot: -1); cbUnavailable
   proc combineUntilAnswered*(c: var ArbiterClient; r: var CombineRound;
       parkNs: int64): AnswerStatus = ansUnavailable

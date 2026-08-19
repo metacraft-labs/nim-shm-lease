@@ -59,6 +59,9 @@ build:
     nim c {{nim-flags}} {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_arbiter_multiprocess \
         tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | tee -a test-logs/build.log
+    nim c {{nim-flags}} {{src-paths}} -d:release \
+        -o:test-logs/test_shm_lease_starvation \
+        tests/test_shm_lease_starvation.nim 2>&1 | tee -a test-logs/build.log
     nim c {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
         -o:test-logs/test_shm_lease_hooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/build.log
@@ -66,7 +69,7 @@ build:
 # Test: the whole suite. Deterministic — no flaky stress in `test`.
 test: test-unit test-integration test-waitword test-wait-integration \
       test-fence-shape test-obsring test-obs-integration test-arbiter \
-      test-arbiter-integration test-hooks
+      test-arbiter-integration test-starvation test-hooks
 
 # Unit: packed-budget arithmetic, fixed-claim-order enforcement, boot+pid+start-time
 # anchoring, over-release refusal, and the NEGATIVE controls proving the overcommit
@@ -208,6 +211,23 @@ test-arbiter-integration:
         tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | \
         tee test-logs/test-arbiter-integration.log
 
+# M6 integration: THE M6 GATE. A large memory claim (8 GiB) is admitted within an
+# ASSERTED BOUND while a 512 MiB small-claim storm runs continuously for the whole
+# of its wait — and the SAME harness FAILS for four other admission policies: the
+# naive packed-CAS loop with no arbiter at all, M5's slot-ordered first fit, arrival
+# order without a reservation, and a reservation handed to the wrong request. The
+# storm's continuity is STRUCTURAL (claimers overlap their reservations, so
+# `held + pending` never dips below the storm's whole demand, and the parent
+# samples the minimum) rather than a matter of scheduling. Takes ~18s, almost all
+# of it the four deliberate starvation deadlines.
+test-starvation:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+        tests/test_shm_lease_starvation.nim 2>&1 | \
+        tee test-logs/test-starvation.log
+
 # EXTERNAL syscall counting for SM-2, the `strace`/`dtruss` half of the milestone's
 # wording. The suite's own SM-2 assertions use the kernel's per-task counter, which
 # is exact and needs no privileges; this recipe is the independent cross-check, and
@@ -316,6 +336,7 @@ lint-nim:
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_arbiter.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_starvation.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/fence_shape_driver.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_wait.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} benchmarks/bench_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
@@ -376,6 +397,16 @@ verify-tla:
     nix shell nixpkgs#tlaplus --command \
         tlc -workers 4 -deadlock -config shm_lease_combine_live_MC.cfg \
             shm_lease_combine_MC.tla
+    echo "=== M6 ADMISSION POLICY: arrival order + one reservation head ==="
+    # The LIVENESS tier. `shm_lease_combine` says nothing about WHICH pending
+    # request a round decides in favour of, because M5's policy was first fit;
+    # M6 adds a policy whose whole content is a liveness property, so it gets its
+    # own model rather than an extension that would multiply MV2's 1.3M-state
+    # graph by a fairness-checked temporal property. `LargeAdmitted` (SM-4) and
+    # `SmallsKeepGoing` (the cure is not permanent underutilization) must BOTH
+    # hold; the three policy mutations below must break the first.
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_admit_MC.cfg shm_lease_admit_MC.tla
     echo "=== MV2 COMBINER: Finding 4's mutation vs. every NON-GHOST invariant ==="
     # GREEN ON PURPOSE, and it is what keeps Finding 4 from overstating itself.
     # `shm_lease_combine_unfenced_MC.cfg` is REQUIRED to violate `NeverBoth` on
@@ -448,6 +479,14 @@ verify-tla-negative:
         -config shm_lease_combine_livelock_MC.cfg shm_lease_combine_MC.tla
     expect_violation "MV2 mutation: round's fit test blind to its own grants -> OVERCOMMIT" \
         -config shm_lease_combine_fit_MC.cfg shm_lease_combine_MC.tla
+    expect_violation "M6 non-vacuity: the reservation really does REFUSE a request that fits" \
+        -config shm_lease_admit_probe.cfg shm_lease_admit_MC.tla
+    expect_violation "M6 mutation: M5's policy (slot order, no reservation) -> LARGE CLAIM STARVES" \
+        -config shm_lease_admit_firstfit_MC.cfg shm_lease_admit_MC.tla
+    expect_violation "M6 mutation: arrival order WITHOUT the reservation -> LARGE CLAIM STARVES" \
+        -config shm_lease_admit_noreserve_MC.cfg shm_lease_admit_MC.tla
+    expect_violation "M6 mutation: the reservation given to the WRONG request -> LARGE CLAIM STARVES" \
+        -config shm_lease_admit_slotorder_MC.cfg shm_lease_admit_MC.tla
     echo "--- the safety half of the no-enforcement mutation MUST still hold:"
     nix shell nixpkgs#tlaplus --command tlc -workers 4 \
         -config shm_lease_claim_ord_nocheck_safety_MC.cfg shm_lease_claim_ord_MC.tla

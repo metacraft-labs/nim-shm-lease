@@ -52,6 +52,7 @@ Tool: `tlaplus-1.7.4` (TLC 2.19) via `nix run nixpkgs#tlaplus`. Wired as
 | **MV2** COMBINER, TWO faults, so the *recovering* round may also be abandoned | `shm_lease_combine_f2_MC.cfg` | **79,487** | **51** | **RAN — green.** Same 11 + `AllSettled` |
 | **MV2** COMBINER, safety under an arbitrarily wrong steal detector | `shm_lease_combine_live_MC.cfg` | **1,325,806** | **55** | **RAN — green.** 10 invariants, safety only (see below) |
 | **MV2** COMBINER, Finding 4's mutation vs. every NON-GHOST invariant | `shm_lease_combine_unfenced_damage_MC.cfg` | **339,869** | **54** | **RAN — green.** 9 invariants + `AllSettled`. This one is green **on purpose** — see Finding 4 |
+| **M6** ADMISSION POLICY, 2 small claimers + 1 large claim, arrival order + one reservation head | `shm_lease_admit_MC.cfg` | **125** | **11** | **RAN — green.** 3 invariants + `LargeAdmitted` (SM-4) + `SmallsKeepGoing` |
 
 **The last row is a green run on a MUTATION, and that is deliberate.**
 `shm_lease_combine_unfenced_damage_MC.cfg` runs Finding 4's `CommitFencedByRole
@@ -96,6 +97,28 @@ state-graph searches.
 | **MV2 FINDING** | `shm_lease_combine_budget_MC.cfg` | `BudgetExact` | 6,310 | 27 |
 | **MV2 FINDING** | `shm_lease_combine_unfenced_MC.cfg` | `NeverBoth` | 669 | 14 (13-state trace) |
 | **MV2 FINDING** | `shm_lease_combine_livelock_MC.cfg` | `EpochBoundNotBinding` | 1,491 | 11 |
+| **M6** non-vacuity | `shm_lease_admit_probe.cfg` | `NeverBlocked` — the reservation really does refuse a request that would have fitted | 102 | 8 |
+| **M6** MUTATION | `shm_lease_admit_firstfit_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted` | 101 (complete) | 8 |
+| **M6** MUTATION | `shm_lease_admit_noreserve_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted` | 101 (complete) | 8 |
+| **M6** MUTATION | `shm_lease_admit_slotorder_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted` | 101 (complete) | 8 |
+
+**The three M6 mutations are the only rows here that break a LIVENESS property
+rather than a safety one, and they still check every safety invariant.** That is
+deliberate: a policy control that starved the large claim by overcommitting would
+prove nothing about starvation, so `TypeOK`, `NoOvercommit` and `QueueIsPending`
+are asserted in the mutated configurations too and all three hold. What breaks is
+`LargeAdmitted` alone.
+
+**All three explore the SAME 101 distinct states, and that is not a copy-paste
+error.** The state variables and the reachable set do not depend on the policy
+constants — only on which transitions are enabled from each state — and in this
+instance every state reachable under one policy is reachable under the others.
+The `slotorder` mutation is the interesting confirmation: it keeps `Reserve =
+TRUE` and yet never reaches a state with `blocked = TRUE`, because a head chosen
+by slot index is the LAST request in the scan and nothing follows it to be
+refused. The multi-process gate measures exactly the same thing — `reservations`
+in the tens of thousands with `reserveBlocks` at zero — which is the model and
+the implementation agreeing about a mutation.
 
 The two **non-vacuity probes** are the load-bearing ones, because they are what
 make the green runs above mean something. Each asserts the *negation* of "all the
@@ -1019,7 +1042,36 @@ under C11 it is permitted outright. See "Finding 2" below.
   mutation against every non-ghost invariant), 3 non-vacuity probes, and 7
   mutations, three of which are Findings 4, 5 and 6 above.
 
-Twenty-nine configurations in total: **11 green** and **18 required to fail**,
+- `tla/shm_lease_admit.tla` — **M6**, the ADMISSION POLICY, and the only model
+  here whose central property is a LIVENESS one. It abstracts a combine round to
+  the single atomic action MV2 proves the commit CAS linearises it to, and models
+  what MV2 deliberately does not: a request that stays PENDING across rounds,
+  capacity that is RELEASED, arrival order, and a reservation. Constants
+  `Reserve` and `ArrivalOrder` select the shipped policy or one of three
+  mutations. It covers no role, no epoch, no steal, no death and no publication —
+  those are `shm_lease_combine.tla`, which M6 does not change.
+- `tla/shm_lease_admit_MC.tla` + 5 cfgs — 1 green (the shipped policy: SM-4's
+  `LargeAdmitted` and `SmallsKeepGoing` both hold), 1 non-vacuity probe (the
+  reservation really does refuse a request that fits — `NeverBlocked` violated at
+  102 states) and 3 mutations, each of which must break `LargeAdmitted` (101
+  distinct states each, complete state graphs).
+
+**WHY M6 GOT ITS OWN MODULE RATHER THAN EXTENDING `shm_lease_combine`.** MV2's
+`:deferred:` says M6 "must extend the model for a requeued request", and the
+requeue IS now modelled — just not inside the combining protocol. Two reasons,
+and the second is the honest one. First, the property M6 adds is orthogonal to
+everything MV2 checks: MV2 says nothing about WHICH pending request a round
+decides in favour of, because M5's policy was first fit and there was nothing to
+say. Second, `shm_lease_combine_live_MC` already explores 1,325,806 states for
+SAFETY ALONE; adding a requeue action, a release action and a fairness-checked
+temporal property to that graph is not a refinement, it is a different model with
+a different cost. **The debt that remains is stated rather than discharged:
+`shm_lease_combine` still has no release action and no requeue, so the interaction
+between a reservation and a combiner that dies mid-round is checked by NEITHER
+model.** A model with both is the right thing to build before M7 puts reclamation
+on the ledger entry.
+
+Thirty-four configurations in total: **12 green** and **22 required to fail**,
 which is the whole set `just verify` runs.
 - `litmus/*.litmus` — 16 herd7 tests across the C11, x86-TSO and AArch64 models:
   the grant-payload publish pair and its relaxed controls on all three models, the

@@ -15,12 +15,13 @@ _RunQuota Observation Store & Shared-Memory Transport_ campaign —
 design authority is
 `reprobuild-specs/RunQuota-Shared-Memory-Transport.md`.
 
-## Status: M2 + M3 + M4 + M5
+## Status: M2 + M3 + M4 + M5 + M6
 
 M2 is the spec's _"§1 the fit check and claim are the easy part"_; M3 is
 _"Waiting Without Spinning"_; M4 is _"The Observation Ring"_; M5 is
-_"§3 flat combining puts the policy in shared memory"_. Nothing beyond those four.
-Read the scope honestly before building on it:
+_"§3 flat combining puts the policy in shared memory"_; M6 is the anti-starvation
+_policy_ that section exists for. Nothing beyond those five. Read the scope
+honestly before building on it:
 
 | Campaign milestone | What it adds                                                                                          | Here?   |
 | ------------------ | ----------------------------------------------------------------------------------------------------- | ------- |
@@ -28,18 +29,27 @@ Read the scope honestly before building on it:
 | **M3**             | futex-class cross-process blocking (`futex` / `os_sync_wait_on_address`), per-waiter wait slots       | **yes** |
 | **M4**             | observation ring: bounded MPSC, counted drops, non-polling consumer (rides `nim-shm-queue`'s Layer 1) | **yes** |
 | **M5**             | flat-combining arbiter: a migrating role, per-waiter grant slots, grant-then-wake                     | **yes** |
-| M6                 | anti-starvation (bounded wait for large claims)                                                       | no      |
+| **M6**             | anti-starvation policy: arrival-order scan, one reservation head, bounded wait for large claims       | **yes** |
 | M7                 | kill injection, steal protocol, reservation reclamation                                               | no      |
 | M8                 | preemption study and go/no-go verdict                                                                 | no      |
 
-The single most important thing this library is still **not**: an anti-starvation
-admission _policy_. M5 adds the arbiter — a global view, taken by whichever client
-holds the migrating role — so the policy now has somewhere to live, and it makes
-bulk admission and grant-then-wake real. But the policy it runs is **first fit in
-slot order**, which starves large claims exactly as the design spec's §2 warns: a
-link action needing 8 GiB can lose indefinitely to a stream of 512 MiB compiles.
-Holding capacity idle for a pending large claim is SM-4, it is M6's gate, and it is
-deliberately not implemented here.
+M5 added the arbiter — a global view, taken by whichever client holds the migrating
+role — so the policy had somewhere to live. M6 put a policy in it, and it is two
+rules: the scan runs in **arrival order**, and the first request a round cannot
+grant becomes that round's single **reservation head**, whose want is withheld from
+every request decided after it. That is capacity held idle for a pending large
+claim instead of spent on a small one that arrived later, which is what the design
+spec's §2 asks for and what first fit in slot order could not do.
+
+What that buys, measured: an 8 GiB claim admitted in 100–111 ms while six processes
+hold or demand 512 MiB each continuously — against four other admission policies,
+including the naive packed-CAS loop, which never admit it at all. What it does not
+buy: optimal packing. Admission is **online**, so the achievable goals are bounded
+waiting and no overcommit, and nothing more than that is claimed.
+
+The single most important thing this library is still **not**: crash-safe in
+practice. A client that dies holding a grant leaks its capacity, and no process is
+ever actually killed mid-round — that is M7.
 
 ## The packed budget word
 
@@ -220,7 +230,7 @@ second grant cannot be published because a second request cannot exist.
 
 **Two places M5 leaves the model, stated because they are not checked anywhere.** A
 request that does not fit is left **pending** rather than refused — which is what
-makes a waiter exist at all, and moves it into M6's bounded-waiting property. That
+makes a waiter exist at all, and is what M6's bounded-waiting property is about. That
 also means "there is work" stays true for an unfittable request, so the arbiter
 declines to take the role unless something pending can actually be granted,
 permanently refused, **or published**, and a round whose scan stamped nothing
@@ -349,7 +359,7 @@ doAssert c.releaseGrant()              # one CAS; the next round redistributes i
 ## Test & benchmark
 
 ```bash
-just test           # unit + the M2, M3, M4 and M5 gates + deterministic interleavings
+just test           # unit + the M2, M3, M4, M5 and M6 gates + deterministic interleavings
 just bench          # POC-local claim/release, wait/wake and per-observation cost
                     # (M1/M8 own the real socket comparison)
 just soak 20        # the M2 gate harness, 20x the rounds per child
@@ -501,8 +511,8 @@ removing the prefault turns a clean timeout into `EFAULT`.
 
 Proves **SM-1** and **SM-2**. Not proven by the M3 gate: SM-3 (no wake
 amplification), SM-4 (bounded wait for large claims), SM-6 (no leaked capacity) and
-SM-8 — SM-3 and SM-8 are M5's and are proven by the gate below; SM-4 and SM-6 remain
-M6's and M7's and are not attempted.
+SM-8 — SM-3 and SM-8 are M5's and SM-4 is M6's, all proven by the gates below;
+SM-6 remains M7's and is not attempted.
 
 ### What the M5 gate proves
 
@@ -558,8 +568,49 @@ CPU slots out of 8, and the reference replay reports exactly the two decisions i
 would not have taken.
 
 Proves **SM-3** and partial **SM-4** (the arbiter exists and decides with a global
-view; _bounded waiting for large claims_ is M6's and is not attempted). Not proven
-here: SM-5/SM-6 — no process is killed and nothing is reclaimed, which is M7.
+view; _bounded waiting for large claims_ is the M6 gate below). Not proven here:
+SM-5/SM-6 — no process is killed and nothing is reclaimed, which is M7.
+
+### What the M6 gate proves
+
+`tests/test_shm_lease_starvation.nim`, seven real processes at deliberately
+differing virtual bases. Capacity 10 GiB; six claimers each holding or demanding
+512 MiB **at every instant** — they publish the next request while still holding
+the current grant, so occupancy never dips, and the parent samples the minimum and
+asserts it. `10 GiB − 3 GiB = 7 GiB < 8 GiB`, so a first-fit round cannot admit the
+large claim in any schedule; a `static: doAssert` refuses to let those four numbers
+be tuned into a gate that passes for free.
+
+1. **The 8 GiB claim is admitted in 100–111 ms** against an asserted 1000 ms bound:
+   20/20 release runs and 15/15 unoptimised runs on an idle host (100–102 ms), and
+   8/8 release runs under 2× CPU oversubscription (100–111 ms).
+2. **Capacity was held idle, observed from outside the arbiter:** the parent saw
+   40,000–460,000 states in which the head was waiting, a small claim was waiting,
+   and up to 8 GiB of free capacity was not being given out. That sampler is
+   corroboration and not the discriminator — it still reads tens of thousands under
+   `amFirstFit`, because it cannot tell capacity being withheld from capacity about
+   to be granted. `reservations > 0` and `overlapTimeouts >= 2` are the assertions
+   that read zero under that mutation.
+3. **The idle hold is bounded** — it lasts exactly as long as the wait above — and
+   small-claim throughput **recovers**: ~29,000/s before the large claim arrives and
+   ~29,000/s in the 300 ms after it is released.
+4. **The scan really ran in arrival order**, with rounds that decided a higher slot
+   before a lower one so that arrival order demonstrably differed from slot order.
+5. **The same harness FAILS for other policies**, which is the milestone's own
+   requirement: the naive packed-CAS loop, M5's slot-ordered first fit, and a
+   reservation handed to the wrong request all fail to admit the claim in 4000 ms
+   while granting 130,000 small claims in the meantime.
+
+The bounded overlap is load-bearing in both directions: with it removed (the
+claimer holds until its replacement arrives, without limit) the shipping arm
+**deadlocks** — the large claim is never admitted, the tail grant rate is zero and
+every claimer blows its own 3 s deadline. That is the opposite defect, and the
+"throughput recovers" assertion is what catches it.
+
+Proves **SM-4**. Its honest gap is recorded in the test: _arrival order without a
+reservation_ is not a structural control — it starves the claim on an idle host and
+admitted it in 1 of 5 runs under load — so the reservation's necessity is carried by
+the formal tier, where TLC exhibits a fair behaviour in which it never gets in.
 
 ### Fast-path cost (M3)
 

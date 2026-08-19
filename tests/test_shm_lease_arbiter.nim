@@ -810,3 +810,347 @@ suite "M5: a combine round is syscall-free":
         " for 200 getppid), wakes=", r.wakes, " wakeSyscalls=", r.wakeSyscalls
       var lv = l
       lv.detach()
+
+# ===========================================================================
+# M6 — THE ANTI-STARVATION POLICY: arrival order, and ONE reservation head.
+# ===========================================================================
+#
+# `RunQuota-Observation-Store.milestones.org` ** M6, and
+# `RunQuota-Shared-Memory-Transport.md` §"2. Policy is the actual obstacle".
+#
+# The multi-process gate (`tests/test_shm_lease_starvation.nim`) proves the
+# END-TO-END property — an 8 GiB claim admitted within a bounded wait under a
+# continuous 512 MiB storm, with four other admission policies failing the same
+# test. THESE tests prove the MECHANISM, deterministically and in one process:
+# which request is scanned first, which one holds capacity idle, how much, and
+# when it stops. Each has a control that switches exactly the mechanism under test
+# off, in the same board, and requires the behaviour to change.
+
+suite "M6 rule 1: the scan runs in ARRIVAL order, not slot order":
+  test "requests published in REVERSE slot order are decided oldest first":
+    # THE FALSIFIABLE PAIR. Three clients publish in reverse slot order, so
+    # arrival order and slot order are exact opposites and no run can satisfy both
+    # readings. Everything fits, so the ORDER is the only thing under test.
+    let (path, l) = newSeg("arrival")
+    defer: cleanup(path)
+    var c2 = mkClient(l, 2)
+    var c1 = mkClient(l, 1)
+    var c0 = mkClient(l, 0)
+    check c2.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    check c1.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    check c0.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    # The tickets really are in publication order, which is what the scan sorts by.
+    let v = c0.view
+    check v.ticketAt(2) < v.ticketAt(1)
+    check v.ticketAt(1) < v.ticketAt(0)
+
+    var r: CombineRound
+    check c0.tryCombine(r) == cbCommitted
+    check r.decisionCount == 3
+    check r.grants == 3
+    # OLDEST FIRST: slots 2, 1, 0 — the exact reverse of the slot order M5 used.
+    check r.decisions[0].slot == 2'u16
+    check r.decisions[1].slot == 1'u16
+    check r.decisions[2].slot == 0'u16
+    for i in 1 ..< r.decisionCount:
+      check r.decisions[i].ticket > r.decisions[i - 1].ticket
+
+  test "...and the CONTROL that turns the ordering off decides slot order":
+    # `amSlotOrder` on the identical board. If the assertions above were reading
+    # a coincidence rather than the policy, this one would agree with them.
+    let (path, l) = newSeg("arrivalctl")
+    defer: cleanup(path)
+    var c2 = mkClient(l, 2)
+    var c1 = mkClient(l, 1)
+    var c0 = mkClient(l, 0)
+    c0.mutations = {amSlotOrder}
+    check c2.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    check c1.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    check c0.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    var r: CombineRound
+    check c0.tryCombine(r) == cbCommitted
+    check r.decisionCount == 3
+    check r.decisions[0].slot == 0'u16
+    check r.decisions[1].slot == 1'u16
+    check r.decisions[2].slot == 2'u16
+    # ...and the tickets DESCEND, which is the inversion the M5 gate's replay
+    # counts and requires to be zero on the shipping path.
+    var inversions = 0
+    for i in 1 ..< r.decisionCount:
+      if r.decisions[i].ticket < r.decisions[i - 1].ticket: inc inversions
+    check inversions == 2
+
+  test "a re-request goes to the BACK of the arrival order":
+    # The fairness rule that keeps one busy client from owning the head position:
+    # `publishRequest` stamps a FRESH ticket, so a client that is granted,
+    # releases and asks again is younger than everything already waiting.
+    let (path, l) = newSeg("reticket")
+    defer: cleanup(path)
+    var a = mkClient(l, 0)
+    var b = mkClient(l, 1)
+    check a.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    let firstTicket = a.view.ticketAt(0)
+    var r: CombineRound
+    check a.tryCombine(r) == cbCommitted
+    check a.collectAnswer() == ansGranted
+    check b.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    check a.releaseGrant()
+    check a.publishRequest(vec(1, 1, 1, 1)) == psPublished
+    check a.view.ticketAt(0) > firstTicket          # a fresh stamp...
+    check a.view.ticketAt(0) > a.view.ticketAt(1)   # ...and it is now the younger
+    check b.tryCombine(r) == cbCommitted
+    check r.decisions[0].slot == 1'u16              # B, which waited, goes first
+
+  test "publishing a request costs ZERO kernel syscalls":
+    # M6 put a monotonic-clock read on the publish path, and `publishRequest`'s
+    # docstring says it never enters the kernel. `CLOCK_MONOTONIC` is served from
+    # the commpage on macOS and the vDSO on Linux, so that is TRUE — but a claim
+    # about syscalls is exactly the kind this campaign measures rather than
+    # asserts, so the kernel's own counter says it.
+    if not syscallCountAvailable():
+      echo "  [skip] no in-process kernel syscall counter on this platform"
+      skip()
+    else:
+      let (path, l) = newSeg("pubsyscalls")
+      defer: cleanup(path)
+      var a = mkClient(l, 0)
+      let c0 = unixSyscallCount()
+      for i in 0 ..< 200: discard getppid()
+      let calib = unixSyscallCount() - c0
+      check calib >= 200'u64
+      var r: CombineRound
+      var published = 0
+      let before = unixSyscallCount()
+      for i in 0 ..< 500:
+        if a.publishRequest(vec(1, 1, 1, 1)) == psPublished: inc published
+        # Settle the request without leaving the process: one round, collect,
+        # release. The round wakes nobody parked, so it is syscall-free too (the
+        # M5 suite measures that separately).
+        discard a.tryCombine(r)
+        discard a.collectAnswer()
+        discard a.releaseGrant()
+      let delta = unixSyscallCount() - before
+      check published == 500
+      check delta == 0'u64
+      echo "  [m6] 500 publish/round/collect/release cycles cost ", delta,
+        " syscalls (calibration ", calib, " for 200 getppid)"
+      var lv = l
+      lv.detach()
+
+suite "M6 rule 2: the OLDEST blocked request holds capacity idle":
+  test "a small claim that FITS is refused because an older large one is waiting":
+    # THE WHOLE OF M6 IN ONE BOARD. `A` holds 6 of 8 CPU slots. `B` then asks for
+    # 4 — which does not fit — and `C`, later, asks for 2, which does. First fit
+    # grants C and B waits for as long as the C-shaped requests keep coming; the
+    # reservation refuses C and keeps the 2 free slots for B.
+    let (path, l) = newSeg("reserve")
+    defer: cleanup(path)
+    var a = mkClient(l, 0)
+    var b = mkClient(l, 1)
+    var c = mkClient(l, 2)
+    var r: CombineRound
+    check a.publishRequest(vec(6, 6, 1, 6)) == psPublished
+    check a.tryCombine(r) == cbCommitted
+    check a.collectAnswer() == ansGranted
+    let v = a.view
+    check v.heldSum().cpuSlots == 6'u32
+
+    check b.publishRequest(vec(4, 4, 1, 4)) == psPublished   # older, does NOT fit
+    check c.publishRequest(vec(2, 2, 1, 2)) == psPublished   # younger, DOES fit
+
+    # THE CAPACITY IS FREE AND IS NOT GIVEN OUT — and the arbiter does not even
+    # take the role to say so, which is the interaction between M6's reservation
+    # and M5's `decidableWork` gate: nothing can be granted or permanently
+    # refused, so no round runs and no epoch is burned while the hold lasts.
+    check vecFits(vec(2, 2, 1, 2), v.capacity - v.heldSum())  # C would fit...
+    check not v.decidableWork()                               # ...and is refused
+    let epoch0 = roleEpoch(v.roleSnapshot())
+    check c.tryCombine(r) == cbNoWork
+    check roleEpoch(v.roleSnapshot()) == epoch0
+    check v.combineSeq() == 1'u32
+
+    # THE CONTROL: the identical board with the reservation switched off. C is
+    # grantable, a round runs, and the 2 free slots go to the request that arrived
+    # SECOND — which is the starvation this milestone exists to remove.
+    var c2 = l.arbiterClient(2)
+    c2.slot = 2
+    c2.mutations = {amNoReserve}
+    check c2.view.decidableWork({amNoReserve})
+    check c2.tryCombine(r) == cbCommitted
+    check r.grants == 1
+    check r.decisions[0].slot == 1'u16          # B considered first (older)...
+    check r.decisions[0].kind == dkPending      # ...and still left waiting
+    check r.decisions[1].slot == 2'u16
+    check r.decisions[1].kind == dkGrant        # C took the capacity B needed
+
+  test "the idle hold ENDS when the head is served, and it served the head first":
+    # The other half of "bounded": a reservation exists only while its head does
+    # not fit, and the instant capacity is released the head — not the younger
+    # request that has been waiting behind it — is the one that gets it.
+    let (path, l) = newSeg("release")
+    defer: cleanup(path)
+    var a = mkClient(l, 0)
+    var b = mkClient(l, 1)
+    var c = mkClient(l, 2)
+    var r: CombineRound
+    check a.publishRequest(vec(6, 6, 1, 6)) == psPublished
+    check a.tryCombine(r) == cbCommitted
+    check a.collectAnswer() == ansGranted
+    check b.publishRequest(vec(4, 4, 1, 4)) == psPublished
+    check c.publishRequest(vec(2, 2, 1, 2)) == psPublished
+    check not a.view.decidableWork()
+
+    check a.releaseGrant()                       # <-- the event that ends the hold
+    check a.view.decidableWork()
+    check b.tryCombine(r) == cbCommitted
+    check r.grants == 2
+    check r.decisions[0].slot == 1'u16
+    check r.decisions[0].kind == dkGrant         # the head, served first
+    check r.decisions[1].slot == 2'u16
+    check r.decisions[1].kind == dkGrant         # and then the one behind it
+    check r.reserveSlot == -1                    # nothing is held idle any more
+    check b.collectAnswer() == ansGranted
+    check c.collectAnswer() == ansGranted
+    check vecFits(a.view.heldSum(), Cap)
+
+  test "AT MOST ONE head per round, and the counters name it":
+    # Reserving for EVERY blocked request would let the reservations sum past the
+    # capacity and stop admission dead — the cure becoming a worse disease. One
+    # head, and the round records which slot and how much.
+    #
+    # The board also gives the round something it CAN do (a request that could
+    # never fit an idle machine, which is refused unconditionally and ahead of any
+    # reservation), so a round really runs and `reserveBlocked` — the in-round
+    # count of requests the hold cost — is exercised rather than gated out.
+    let (path, l) = newSeg("onehead")
+    defer: cleanup(path)
+    var a = mkClient(l, 0)
+    var b = mkClient(l, 1)
+    var c = mkClient(l, 2)
+    var d = mkClient(l, 3)
+    var e = mkClient(l, 4)
+    var r: CombineRound
+    check a.publishRequest(vec(6, 6, 1, 6)) == psPublished
+    check a.tryCombine(r) == cbCommitted
+    check a.collectAnswer() == ansGranted
+    check b.publishRequest(vec(4, 4, 1, 4)) == psPublished   # blocked -> the HEAD
+    check c.publishRequest(vec(3, 3, 1, 3)) == psPublished   # blocked, no reserve
+    check d.publishRequest(vec(2, 2, 1, 2)) == psPublished   # fits, but refused
+    check e.publishRequest(vec(9, 9, 1, 9)) == psPublished   # can NEVER fit
+
+    check a.view.decidableWork()                # ...because of E
+    check b.tryCombine(r) == cbCommitted
+    check r.grants == 0
+    check r.reserveSlot == 1                    # exactly ONE head, and it is B
+    check r.reservedVec == vec(4, 4, 1, 4)      # ...reserving ONLY B's want
+    check r.reserveBlocked == 1                 # D fitted what was free; C did not
+    check r.decisionCount == 4
+    check r.decisions[0].slot == 1'u16 and r.decisions[0].kind == dkPending
+    check r.decisions[0].reserved                       # the head, flagged
+    check r.decisions[1].slot == 2'u16 and r.decisions[1].kind == dkPending
+    check not r.decisions[1].reserved                   # blocked, but not a head
+    check r.decisions[2].slot == 3'u16 and r.decisions[2].kind == dkPending
+    check r.decisions[3].slot == 4'u16 and r.decisions[3].kind == dkRefuse
+    check e.collectAnswer() == ansRefused       # the permanent refusal is an ANSWER
+
+  test "held capacity never RISES while a head is reserved":
+    # The invariant the bounded-wait argument rests on: from the moment a request
+    # becomes the head, every grant satisfies `want <= capacity - held - reserved`,
+    # so no grant pushes `held` above `capacity - want(head)` and `held` is driven
+    # monotonically down to where the head fits. Asserted over a sequence of rounds
+    # with fresh small requests arriving between them, which is the storm in
+    # miniature.
+    let (path, l) = newSeg("monotone")
+    defer: cleanup(path)
+    var a = mkClient(l, 0)
+    var head = mkClient(l, 1)
+    var s: array[3, ArbiterClient]
+    for i in 0 ..< 3: s[i] = mkClient(l, 2 + i)
+    var r: CombineRound
+    check a.publishRequest(vec(5, 5, 1, 5)) == psPublished
+    check a.tryCombine(r) == cbCommitted
+    check a.collectAnswer() == ansGranted
+    check head.publishRequest(vec(6, 6, 1, 6)) == psPublished   # 6 > 8 - 5
+    var prev = a.view.heldSum().cpuSlots
+    check prev == 5'u32
+    for round in 0 ..< 4:
+      for i in 0 ..< 3:
+        if stateOf(s[i].view.stateAt(2 + i)) == rqIdle:
+          check s[i].publishRequest(vec(1, 1, 1, 1)) == psPublished
+      discard s[0].tryCombine(r)
+      let h = a.view.heldSum().cpuSlots
+      # THE INVARIANT, STATED CORRECTLY: `held` is 5 when the head arrives and the
+      # head wants 6 of 8, so it is ALREADY above `capacity - want(head)`. What the
+      # reservation guarantees is not that `held` is immediately below that line —
+      # nothing could give that — but that it never RISES: no grant is made that
+      # would push it up, so the only direction is down, and the head is served
+      # when it gets there. Three small requests arrive in every round and not one
+      # of them may be granted.
+      check h <= prev
+      prev = h
+    check prev == 5'u32
+    check a.releaseGrant()
+    check head.tryCombine(r) == cbCommitted
+    check head.collectAnswer() == ansGranted     # ...and the head is served
+
+suite "M6: decidableWork stayed EXACT under the new policy":
+  test "over a sweep of boards, the gate and the round agree":
+    # M5's verification failed TWICE on this predicate drifting from the loop it
+    # gates, so M6 asserts the equivalence executably rather than in a comment.
+    # The property, in both directions:
+    #   * `decidableWork` true  =>  the round COMMITS (it stamped at least one
+    #     ledger entry, or published an outstanding one);
+    #   * `decidableWork` false =>  `tryCombine` returns `cbNoWork` WITHOUT
+    #     burning an epoch or moving the combine sequence.
+    # An over-eager predicate reintroduces the empty rounds `EpochBoundNotBinding`
+    # rules out; a shy one drops real work.
+    let (path, l) = newSeg("exact", slots = 6)
+    defer: cleanup(path)
+    var cs: array[6, ArbiterClient]
+    for i in 0 ..< 6: cs[i] = mkClient(l, i)
+    let v = cs[0].view
+    var r: CombineRound
+    var trueCases = 0
+    var falseCases = 0
+    var seed = 0x9E3779B9'u32
+    proc nextRand(): uint32 =
+      seed = seed * 1664525'u32 + 1013904223'u32
+      (seed shr 16) and 0xFFFF'u32
+    for step in 0 ..< 400:
+      # Perturb the board: publish, collect and release at random, with wants
+      # spread across "fits easily", "fits only when idle" and "can never fit".
+      let who = int(nextRand() mod 6'u32)
+      case int(nextRand() mod 4'u32)
+      of 0:
+        if stateOf(v.stateAt(who)) == rqIdle:
+          let n = 1'u32 + nextRand() mod 9'u32
+          discard cs[who].publishRequest(vec(n, n, 1, n))
+      of 1:
+        if v.answerArrived(who): discard cs[who].collectAnswer()
+      else:
+        # Releases are drawn twice as often as publishes, deliberately: without
+        # that the board saturates and the sweep never revisits the decidable
+        # side, which would make half the equivalence untested.
+        if v.answerArrived(who): discard cs[who].collectAnswer()
+        if stateOf(v.stateAt(who)) == rqHolding: discard cs[who].releaseGrant()
+
+      let dw = v.decidableWork()
+      let wp = v.workPending()
+      let epoch0 = roleEpoch(v.roleSnapshot())
+      let seq0 = v.combineSeq()
+      let st = cs[who].tryCombine(r)
+      if wp and dw:
+        inc trueCases
+        check st == cbCommitted
+        check v.combineSeq() > seq0
+      elif wp and not dw:
+        inc falseCases
+        check st == cbNoWork
+        check roleEpoch(v.roleSnapshot()) == epoch0
+        check v.combineSeq() == seq0
+    # ...and the sweep really did visit both sides. A run that only ever saw one
+    # of them would prove half of the equivalence and read as a pass.
+    check trueCases > 0
+    check falseCases > 0
+    echo "  [m6] decidableWork sweep: ", trueCases, " decidable / ", falseCases,
+      " not, over 400 perturbations"

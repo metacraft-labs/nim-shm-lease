@@ -17,6 +17,7 @@ tests/test_shm_lease_obsring
 tests/test_shm_lease_obs_multiprocess
 tests/test_shm_lease_arbiter
 tests/test_shm_lease_arbiter_multiprocess
+tests/test_shm_lease_starvation
 benchmarks/bench_claim
 benchmarks/bench_wait
 benchmarks/bench_obsring
