@@ -1,0 +1,38 @@
+C seqlock-recheck-vs-payload-RELAXED-control
+(*
+ * REQUIRED-TO-FAIL CONTROL for `seqlock-recheck-vs-payload.litmus`: the
+ * reader's ACQUIRE FENCE is deleted and its first seq load downgraded to
+ * relaxed. The writer is UNCHANGED and still fully fenced, which is the point --
+ * this control isolates the READER'S half of the ordering, so a Sometimes here
+ * cannot be blamed on the publish side.
+ *
+ * MV3's gate requires it: "a relaxed variant of EACH pair MUST produce the torn
+ * read under at least one of C11/ARMv8".
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **ALLOWED / "Sometimes"**. The reader's two
+ * seq loads agree, its validation passes, and the value it returns straddles a
+ * writer round. This is the shape a correct-looking hand-written seqlock has.
+ *)
+{
+  seq = 0;
+  d1 = 0;
+  d2 = 0;
+}
+
+P0 (atomic_int *seq, atomic_int *d1, atomic_int *d2) {
+  atomic_store_explicit(seq, 1, memory_order_relaxed);
+  atomic_thread_fence(memory_order_release);
+  atomic_store_explicit(d1, 1, memory_order_relaxed);
+  atomic_store_explicit(d2, 1, memory_order_relaxed);
+  atomic_thread_fence(memory_order_release);
+  atomic_store_explicit(seq, 2, memory_order_relaxed);
+}
+
+P1 (atomic_int *seq, atomic_int *d1, atomic_int *d2) {
+  int r0 = atomic_load_explicit(seq, memory_order_relaxed);
+  int r1 = atomic_load_explicit(d1, memory_order_relaxed);
+  int r2 = atomic_load_explicit(d2, memory_order_relaxed);
+  int r3 = atomic_load_explicit(seq, memory_order_relaxed);
+}
+
+exists (1:r0 = 0 /\ 1:r3 = 0 /\ (1:r1 = 1 \/ 1:r2 = 1))

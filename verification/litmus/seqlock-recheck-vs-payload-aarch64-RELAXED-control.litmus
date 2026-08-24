@@ -1,0 +1,29 @@
+AArch64 seqlock-recheck-vs-payload-aarch64-RELAXED-control
+(*
+ * REQUIRED-TO-FAIL CONTROL for `seqlock-recheck-vs-payload-aarch64.litmus`:
+ * the reader's `DMB ISHLD` is deleted and its `LDAR` becomes a plain `LDR`.
+ * THE WRITER IS UNCHANGED and still carries both `DMB ISH` barriers, so a
+ * Sometimes here is the reader's fault and nobody else's.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **ALLOWED / "Sometimes"**.
+ *
+ * THIS IS THE ONE MV3 SINGLES OUT. A seqlock reader whose publish side is
+ * perfectly fenced still returns torn data on ARMv8 if its own second counter
+ * load is not ordered after the payload reads -- and on x86-TSO
+ * (`-x86-RELAXED-control`) the same code is FORBIDDEN from doing so, so no
+ * amount of testing on a development laptop will show it.
+ *)
+{
+0:X0=seq; 0:X1=d1; 0:X2=d2;
+1:X0=seq; 1:X1=d1; 1:X2=d2;
+}
+ P0             | P1            ;
+ MOV W5,#1      | LDR W3,[X0]   ;
+ STR W5,[X0]    | LDR W4,[X1]   ;
+ DMB ISH        | LDR W5,[X2]   ;
+ STR W5,[X1]    | LDR W6,[X0]   ;
+ STR W5,[X2]    |               ;
+ DMB ISH        |               ;
+ MOV W6,#2      |               ;
+ STR W6,[X0]    |               ;
+exists (1:X3=0 /\ 1:X6=0 /\ (1:X4=1 \/ 1:X5=1))

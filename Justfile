@@ -136,7 +136,7 @@ test-wait-integration:
 # deliberately opt-in — TLC and herd7 are not in the dev shell — and the litmus
 # tests it runs CANNOT fail in response to a source change: a `.litmus` file is a
 # standalone model, so herd7's verdict is a function of that file alone. Delete
-# `fullFence()` from `waitword.nim` and all sixteen litmus verdicts still pass.
+# `fullFence()` from `waitword.nim` and all twenty-eight litmus verdicts still pass.
 # The person who would delete it is optimising `src/` and runs `just test`; this is
 # the tier that has to notice. It needs nothing `test` does not already need — the
 # Nim compiler and the platform's `objdump`.
@@ -392,7 +392,7 @@ lint-nim:
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/lint-nim.log
 
 # ===========================================================================
-# MV1 + MV2 — the FORMAL / weak-memory verification tier (`verification/`).
+# MV1 + MV2 + MV3 — the FORMAL / weak-memory verification tier (`verification/`).
 # ===========================================================================
 #
 # NOT part of `test`: TLC is not in the dev shell, so these recipes pull it from
@@ -404,8 +404,10 @@ lint-nim:
 verify: verify-tla verify-tla-negative verify-litmus
 
 # TLA+/TLC over the shipped protocol models — MV1's CLAIM and WAIT (gate items
-# (a) and (b)) and MV2's flat-combining COMBINER, which is modelled BEFORE M5
-# implements it. Every invariant must HOLD and every liveness property must hold.
+# (a) and (b)) — and over TWO protocols modelled BEFORE the code that must obey
+# them: MV2's flat-combining COMBINER (before M5) and MV3's per-entry SEQLOCK for
+# the published aggregate table (before M13b). Every invariant must HOLD and
+# every liveness property must hold.
 verify-tla:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -463,6 +465,34 @@ verify-tla:
     # never exceeds the machine.
     nix shell nixpkgs#tlaplus --command \
         tlc -workers 4 -config shm_lease_reclaim_MC.cfg shm_lease_reclaim_MC.tla
+    echo "=== MV3 SEQLOCK: the published aggregate table, modelled BEFORE M13b ==="
+    # MV3, and it is MV2's precedent applied again: `shm_lease_seqlock.tla`
+    # describes NOTHING in `../src`. It is a constraint on what M13b may be
+    # written as. `NoTornRead` is the gate's sentence transcribed;
+    # `ReaderTerminates` is reader termination under a writer that eventually
+    # stops; `WriterAlwaysEnabled` is "a writer never blocks on a reader" as a
+    # state predicate. `AcceptedMatchesCounter` is sharper than the gate asks
+    # for and is what surfaced the counter-width finding.
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_seqlock_MC.cfg shm_lease_seqlock_MC.tla
+    echo "=== MV3 SEQLOCK: a WIDER entry -- three payload words, not two ==="
+    # A three-word entry has a tear shape a two-word one does not: first and
+    # last word from the new round with the middle word from the old. The
+    # published table carries several counters per key, so this is the shape
+    # M13b actually has rather than a bigger number.
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_seqlock_wide_MC.cfg \
+            shm_lease_seqlock_MC.tla
+    echo "=== MV3 SEQLOCK: the writer finishes with readers given NO FAIRNESS ==="
+    # THE STRONG FORM OF "a writer never blocks on a reader". `SpecWriterOnly`
+    # gives weak fairness to the writer alone, so TLC must consider behaviours
+    # in which a reader takes one step and then never takes another -- stopped
+    # in a debugger, swapped out, or killed with a snapshot half-taken. Same
+    # device `shm_lease_wait.tla` uses to withhold fairness from `SpuriousWake`.
+    # `shm_lease_seqlock_wblock_live_MC.cfg` is required to BREAK this.
+    nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_lease_seqlock_writeronly_MC.cfg \
+            shm_lease_seqlock_MC.tla
     echo "=== MV2 COMBINER: Finding 4's mutation vs. every NON-GHOST invariant ==="
     # GREEN ON PURPOSE, and it is what keeps Finding 4 from overstating itself.
     # `shm_lease_combine_unfenced_MC.cfg` is REQUIRED to violate `NeverBoth` on
@@ -554,19 +584,49 @@ verify-tla-negative:
     expect_violation "M6 mutation: the reservation given to the WRONG request -> LARGE CLAIM STARVES" \
         -config shm_lease_admit_slotorder_MC.cfg shm_lease_admit_MC.tla
     echo "--- the safety half of the no-enforcement mutation MUST still hold:"
+    expect_violation "MV3 non-vacuity: odd seq, a failed re-check, a TORN raw snapshot, a mid-round load, and a completed read all occur" \
+        -config shm_lease_seqlock_MC_probe.cfg shm_lease_seqlock_MC.tla
+    expect_violation "MV3 non-vacuity: a reader's OWN payload loads really do straddle a writer round" \
+        -config shm_lease_seqlock_torn_probe.cfg shm_lease_seqlock_MC.tla
+    # THE GATE'S NAMED CONTROL: "the model with the reader's retry removed MUST
+    # violate no-torn-read". Everything else about the structure still works.
+    expect_violation "MV3 MUTATION: the reader's retry removed -> torn read accepted" \
+        -config shm_lease_seqlock_noretry_MC.cfg shm_lease_seqlock_MC.tla
+    expect_violation "MV3 MUTATION: the bump-to-even issued BEFORE the payload stores -> torn read" \
+        -config shm_lease_seqlock_unfenced_MC.cfg shm_lease_seqlock_MC.tla
+    expect_violation "MV3 MUTATION: the reader's SECOND seq load hoisted above its payload loads -> torn read" \
+        -config shm_lease_seqlock_hoist_MC.cfg shm_lease_seqlock_MC.tla
+    expect_violation "MV3 MUTATION: the reader keeps the comparison and drops the ODD test -> torn read" \
+        -config shm_lease_seqlock_noparity_MC.cfg shm_lease_seqlock_MC.tla
+    # FINDING 7. Nothing is deleted and nothing is reordered: the counter merely
+    # WRAPS, which the structures spec never forbids because it never states a
+    # width. `s2 == s1` stops being evidence of stability the moment the counter
+    # can return to a value it has left.
+    expect_violation "MV3 FINDING: a counter that WRAPS under a descheduled reader -> torn read (ABA)" \
+        -config shm_lease_seqlock_wrap_MC.cfg shm_lease_seqlock_MC.tla
+    # These two are what make `shm_lease_seqlock_writeronly_MC.cfg` evidence
+    # rather than a property of the transcription: with the coupling introduced,
+    # the writer really can be blocked, for an instant and then forever.
+    expect_violation "MV3 MUTATION: a writer that waits for in-flight readers is BLOCKABLE (safety)" \
+        -config shm_lease_seqlock_wblock_MC.cfg shm_lease_seqlock_MC.tla
+    expect_violation "MV3 MUTATION: ...and WEDGED forever by a reader that stops between its two seq loads (liveness)" \
+        -config shm_lease_seqlock_wblock_live_MC.cfg shm_lease_seqlock_MC.tla
+
     nix shell nixpkgs#tlaplus --command tlc -workers 4 \
         -config shm_lease_claim_ord_nocheck_safety_MC.cfg shm_lease_claim_ord_MC.tla
 
-# herd7 litmus tests (MV1 gate item (c)): the ordering pairs the structures depend
+# herd7 litmus tests (MV1 gate item (c), extended by MV3): the ordering pairs the
+# structures depend
 # on, under the C11, x86-TSO and AArch64 memory models. This is the tier that
 # settles what TLC structurally cannot — TLC explores sequentially-consistent
 # interleavings and does not model reordering.
 #
-# The runner CHECKS EVERY VERDICT rather than printing output, and five of the
-# sixteen tests are required to be ALLOWED (they are the controls that make the
-# Forbidden verdicts mean something, plus the `:first_target:` defect itself,
+# The runner CHECKS EVERY VERDICT rather than printing output, and nine of the
+# twenty-eight tests are required to be ALLOWED (they are the controls that make
+# the Forbidden verdicts mean something, plus the `:first_target:` defect itself,
 # which is kept as the "before" half of its own regression barrier now that the
-# fix has landed).
+# fix has landed, plus MV3's four relaxed seqlock controls, which its gate
+# requires by name).
 #
 # nixpkgs has NO herdtools7 on aarch64-darwin under any attribute, so
 # `verification/litmus/get-herd7.sh` builds it through opam against the nixpkgs

@@ -1,4 +1,4 @@
-# nim-shm-lease — formal / weak-memory verification tier (campaign milestones MV1 + MV2, extended by M6 and M7)
+# nim-shm-lease — formal / weak-memory verification tier (campaign milestones MV1 + MV2 + MV3, extended by M6 and M7)
 
 This directory is the **formal** verification tier for the multi-process,
 file-backed lease structures in `../src/shm_lease.nim`,
@@ -9,15 +9,35 @@ arbiter gate, the M6 anti-starvation gate, the M7 kill-injection gate,
 deterministic schedule-hook interleavings, mutation-tested assertions), and it
 exists because those tests **sample** the schedule space and cannot exhaust it.
 
-**MV2 is a different kind of entry and it is worth naming the difference.** MV1
-modelled code that had already shipped. `tla/shm_lease_combine.tla` models the
-M5 flat-combining arbiter **before M5 exists**, so it is not a description of
-anything in `../src` — it is a *constraint on what M5 may be written as*. Four of
-its results (Findings 3 to 6 below) are layout and algorithm requirements that
-would each have been expensive to discover from a running implementation, and one
-of them — that the commit and the role transfer must be resolved by a single CAS
-on a single word — is not expressible as a patch at all once the words are in
-use.
+**MV2 and MV3 are a different kind of entry and it is worth naming the
+difference.** MV1 modelled code that had already shipped.
+`tla/shm_lease_combine.tla` models the M5 flat-combining arbiter **before M5
+exists**, so it is not a description of anything in `../src` — it is a
+*constraint on what M5 may be written as*. Four of its results (Findings 3 to 6
+below) are layout and algorithm requirements that would each have been expensive
+to discover from a running implementation, and one of them — that the commit and
+the role transfer must be resolved by a single CAS on a single word — is not
+expressible as a patch at all once the words are in use.
+
+`tla/shm_lease_seqlock.tla` is **MV3**, and it does the same thing for the
+published aggregate table's per-entry seqlock **before M13b writes it**. It
+models a structure that does not live in this repo at all — the table is
+`runquotad`'s, specified in
+`reprobuild-specs/RunQuota-Shared-Memory-Structures.md` §"Structures Not Yet
+Built" and `RunQuota-Shared-Memory-Transport.md` §1b — and it is here because
+this is where the weak-memory tier is. **A seqlock is the sharpest case for
+modelling first**: its reader races the writer *by construction*, so "read the
+counter, read the payload, read the counter again" is a sketch rather than an
+implementation, and the C11 rendering of it needs relaxed atomics with explicit
+fences that the four lines of the spec do not mention. It produced **two**
+results, of two different kinds and labelled as such: Finding 7 is a checked
+violation — a *width* requirement on a field the spec has not sized yet — and
+Finding 8 is a hazard the modelling boundary exposed that **nothing here
+checks**.
+
+**MV3 touches no code and no test.** `../src` and `../tests` are unchanged by it,
+so the 132 dynamic tests above are exactly the 132 that were there before, and
+nothing in this milestone can be read as evidence about them.
 
 Its sibling is `../../nim-shm-gset/verification/`, and this README deliberately
 follows that one's conventions: a table of what actually **RAN** with state
@@ -34,9 +54,19 @@ lost-wakeup freedom depends. Neither is amenable to exhaustive dynamic testing.
 
 ## What is RUNNABLE on this host (and was RUN)
 
-Host: macOS / Darwin 25.5 (macOS 26.5.1), arm64, 16 KiB pages, 2026-08-17.
-Tool: `tlaplus-1.7.4` (TLC 2.19) via `nix run nixpkgs#tlaplus`. Wired as
+Host: macOS / Darwin 25.5 (macOS 26.5.1), arm64, 16 KiB pages, 2026-08-17;
+MV3's rows re-run and added 2026-08-24 on the same host. Tool:
+`tlaplus-1.7.4` (TLC 2.19) via `nix run nixpkgs#tlaplus`. Wired as
 `just verify-tla` and `just verify-tla-negative`.
+
+**Like MV1 and MV2 and unlike M2/M3/M4, these results are not confined to the
+host that produced them.** TLC explores sequentially-consistent interleavings of
+a protocol and herd7 evaluates a litmus test against a *named* memory model;
+both verdicts are properties of the model, not of the machine that enumerated
+it, and every state count below is a function of the model and its constants
+alone. What is host-dependent is only the *tooling route* — that
+`nix shell nixpkgs#tlaplus` resolves here and that herd7 had to be built from
+source through opam because nixpkgs has no `herdtools7` on aarch64-darwin.
 
 ### The shipped protocols — every invariant HOLDS
 
@@ -55,6 +85,9 @@ Tool: `tlaplus-1.7.4` (TLC 2.19) via `nix run nixpkgs#tlaplus`. Wired as
 | **MV2** COMBINER, Finding 4's mutation vs. every NON-GHOST invariant | `shm_lease_combine_unfenced_damage_MC.cfg` | **339,869** | **54** | **RAN — green.** 9 invariants + `AllSettled`. This one is green **on purpose** — see Finding 4 |
 | **M6** ADMISSION POLICY, 2 small claimers + 1 large claim, arrival order + one reservation head | `shm_lease_admit_MC.cfg` | **125** | **11** | **RAN — green.** 3 invariants + `LargeAdmitted` (SM-4) + `SmallsKeepGoing` |
 | **M7** RESERVATION + COMBINE ROLE + DEATH + RECLAMATION, in one model | `shm_lease_reclaim_MC.cfg` | **2,348** | **17** | **RAN — green.** 6 invariants + `LargeAdmitted` + `SmallsKeepGoing` + `NoLeakedCapacity` (SM-6) |
+| **MV3** SEQLOCK, 2 readers, a 2-word entry, 3 writer rounds | `shm_lease_seqlock_MC.cfg` | **7,099,395** (19,673,012 generated) | **50** | **RAN — green.** 6 invariants + `ReaderTerminates` + `WriterFinishes` |
+| **MV3** SEQLOCK, a WIDER entry — 3 payload words, 2 rounds | `shm_lease_seqlock_wide_MC.cfg` | **3,333,742** (9,134,570 generated) | **50** | **RAN — green.** Same 6 + both properties |
+| **MV3** SEQLOCK, the writer finishes with readers given **NO FAIRNESS** | `shm_lease_seqlock_writeronly_MC.cfg` | **7,099,395** (19,673,012 generated) | **50** | **RAN — green.** 3 invariants + `WriterFinishes` under `SpecWriterOnly` |
 
 **The last row is a green run on a MUTATION, and that is deliberate.**
 `shm_lease_combine_unfenced_damage_MC.cfg` runs Finding 4's `CommitFencedByRole
@@ -108,6 +141,22 @@ state-graph searches.
 | **M7** MUTATION | `shm_lease_reclaim_noreclaim_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted` + `NoLeakedCapacity`: a dead claimer's grant is withheld forever (SM-6) | 1,812 (complete) | — (`-deadlock`, see below) |
 | **M7** MUTATION | `shm_lease_reclaim_live_MC.cfg` | `NoLiveReclaim` — the MIRROR IMAGE: a live holder is reclaimed, `NoOvercommitReal` follows | 106 / 89 / 136 (run-dependent) | 5 (run-dependent) |
 | **M7** MUTATION | `shm_lease_reclaim_nosteal_MC.cfg` | **`Temporal properties were violated`** — `LargeAdmitted`: a combiner that died mid-round while a reservation stood wedges admission (SM-5) | 2,312 (complete) | — (`-deadlock`, see below) |
+| **MV3** non-vacuity | `shm_lease_seqlock_MC_probe.cfg` | `ProbeAllReached` — odd counter seen, re-check failed, raw snapshot torn, payload loaded mid-round, read completed | 34,694 / 36,688 (run-dependent) | 20 |
+| **MV3** non-vacuity | `shm_lease_seqlock_torn_probe.cfg` | `ProbeRawTornReached` — a reader's **own** payload loads really do straddle a writer round | 905 / 1,164 (run-dependent) | 11 |
+| **MV3** MUTATION | `shm_lease_seqlock_noretry_MC.cfg` | `NoTornRead` — **the gate's named control: the reader's retry removed** | 905 / 966 (run-dependent) | 11 |
+| **MV3** MUTATION | `shm_lease_seqlock_unfenced_MC.cfg` | `NoTornRead` — the bump-to-even issued **before** the payload stores | 1,433 / 1,471 (run-dependent) | 12 |
+| **MV3** MUTATION | `shm_lease_seqlock_hoist_MC.cfg` | `NoTornRead` — the reader's **second** seq load hoisted above its payload loads | 2,871 / 3,065 (run-dependent) | 12 |
+| **MV3** MUTATION | `shm_lease_seqlock_noparity_MC.cfg` | `NoTornRead` — the odd test dropped, the comparison kept | 961 / 1,089 (run-dependent) | 11 |
+| **MV3 FINDING** | `shm_lease_seqlock_wrap_MC.cfg` | `NoTornRead` — **the counter WRAPS under a descheduled reader (ABA)**; nothing is deleted and nothing is reordered | 20,181 / 20,214 (run-dependent) | 19 |
+| **MV3** MUTATION | `shm_lease_seqlock_wblock_MC.cfg` | `WriterAlwaysEnabled` — a writer that waits for in-flight readers is blockable | 24 / 58 (run-dependent) | 5 |
+| **MV3** MUTATION | `shm_lease_seqlock_wblock_live_MC.cfg` | **`Temporal properties were violated`** — `WriterFinishes`: …and **wedged forever** by a reader that stops between its two seq loads | 354,795 / 368,975 (run-dependent) | — (liveness) |
+
+**Every MV3 row above is marked run-dependent and every one of them was
+observed twice with different counts**, which is the same caveat the M7 rows
+carry and for the same reason: TLC stops mid-BFS with four workers, so what is
+reproducible is *which invariant is named*, not how many states were explored
+first. A re-runner who sees different counts here has found nothing; one who sees
+a different invariant named, or no violation at all, has.
 
 **The three M6 mutations are the only rows here that break a LIVENESS property
 rather than a safety one, and they still check every safety invariant.** That is
@@ -299,7 +348,25 @@ for a third as many models. M6 and M7 brought it to **forty** TLC configurations
 (13 green + 27 required-to-fail), and two consecutive end-to-end runs of that same
 set on the same host measured **2 min 1 s** and **5 min 57 s** — a factor of three
 apart, for the reason this paragraph exists. M7's six configurations contribute
-about 4 s of actual checking between them. That is the point about the clock: it is measuring
+about 4 s of actual checking between them.
+
+**MV3 changes that arithmetic, and it is the first entry in this tier whose cost
+is real checking rather than startup.** It brings the set to **fifty-two** TLC
+configurations (16 green + 36 required-to-fail). Its three green runs are
+**7,099,395**, **3,333,742** and **7,099,395** distinct states and took **6 min
+34 s**, **2 min 39 s** and **1 min 58 s** — about **11 minutes**, against roughly
+30 s for everything MV1, MV2, M6 and M7 check between them. Its nine
+required-to-fail configurations are cheap (the largest, the liveness form of the
+writer-blocking mutation, aborts a few hundred thousand distinct states in; the
+other eight abort under 40,000, and six of those under 5,000 — all run-dependent,
+see the table above). The size comes from the payload being *per-word* on both
+sides, which is
+not negotiable: collapse it and `NoTornRead` becomes unfalsifiable. A reviewer
+who wants a faster loop should drop `NumRounds` to 2 in
+`shm_lease_seqlock_MC.cfg` and understand that they have stopped checking whether
+a retry can be interrupted a second time.
+
+That is the point about the clock: it is otherwise measuring
 `nix shell` and JVM startup and the state of `channels.nixos.org`, not the
 checking. Only the state counts are reproducible.
 
@@ -491,6 +558,59 @@ default).
   can raise them; the claim model at `Rounds = 2` is already 39 s of wall time on
   16 cores.
 
+### Coverage boundaries specific to MV3
+
+- **The models cover ORDERING only, and cross-mapping is out of scope by
+  design.** That the structure is also correct when `runquotad` and each client
+  map the segment at **different virtual bases** is SM-7's property and is gated
+  by **execution**, not by model — the same split M3 used, where `herd7` covered
+  the wake ordering and `test-wait-integration` covered the differing bases.
+  M13b's gate already asserts it by execution. Nothing here should be read as
+  evidence about it.
+
+- **`WriterOrdered`, `ReaderOrdered` and `ReaderChecksParity` are
+  PROTOCOL-ORDER mutations, not memory-model simulations.** They reorder or
+  delete a *step*, exactly as `PayloadFirst` does in `shm_lease_wait.tla`.
+  `ReaderOrdered = FALSE` shows what a hoisted second load *does to the
+  protocol*; it is not evidence that any compiler or architecture will hoist it.
+  That question is herd7's and its answer differs per model — Allowed under C11
+  and ARMv8, **Forbidden under x86-TSO**. This module deliberately does **not**
+  carry `shm_lease_wait.tla`'s one-pair store-buffer abstraction: that
+  abstraction was built and validated for one pair and must not be quoted for
+  another.
+
+- **One entry.** The spec's reason for a per-entry seqlock — "so a writer
+  updating one key never stalls a reader of another" — is a claim about
+  *independence*, and with a per-entry counter it is structural. What is modelled
+  is the stronger local statement: the writer of *this* entry does not stall a
+  reader of *this* entry either (`WriterAlwaysEnabled`, `ReaderAlwaysEnabled`).
+
+- **No hash table, no eviction, no absent key, and one hazard this leaves
+  uncovered.** Open addressing, recency/frequency eviction and the miss path are
+  M13b's, and a miss is answered before the seqlock is entered. But **an entry
+  being EVICTED AND REUSED FOR A DIFFERENT KEY while a reader is inside it is
+  NOT covered by any model here**, and it is not the same hazard as tearing: the
+  reader would return a *coherent* payload belonging to *another key*, which
+  `NoTornRead` would not catch and which the counter alone cannot detect. M13b
+  must either keep the key in the entry and re-check it inside the seqlock, or
+  make eviction bump the counter — and it must state which. See Finding 8.
+
+- **Single-writer discipline is a modelling ASSUMPTION, not a checked
+  property.** There is one writer because the spec makes it a *mapping
+  permission* rule — clients must not hold a writable mapping — and M13b gates it
+  by inspection, which is the right instrument. A second writer would need a
+  different structure, not a stronger invariant.
+
+- **No retry counter is carried.** A counter would multiply the state graph by
+  its range to record something the `rprobe` ghost already records as a
+  reachability question. M13b's own gate asserts a **non-zero reader-retry
+  counter at runtime**, and that is the right instrument for it — a model cannot
+  tell you that the concurrency actually happened on a real host.
+
+- **The reader takes ONE snapshot and stops.** Every window this protocol has is
+  inside one attempt; a looping reader would multiply the graph without adding a
+  window.
+
 ## What the invariants establish
 
 ### CLAIM (`shm_lease_claim.tla`) — MV1 gate item (a)
@@ -566,6 +686,50 @@ see Finding 3's table, which had this wrong in an earlier draft. Meanwhile
 `shm_lease_combine_counter_MC` fails `NoDoubleGrant` and `GrantCoherent` only —
 which is itself the evidence that the two mutations break *different* things.
 
+### SEQLOCK (`shm_lease_seqlock.tla`) — the MV3 gate, modelled before M13b exists
+
+The protocol the model pins:
+
+- **One `seq` word per entry**, bumped to **odd** before the payload stores and
+  back to **even** after them. Odd means "a round is in flight".
+- **Payload = several words**, and every one of them is its own step on both
+  sides. A one-word entry has no tearing to prevent and would make `NoTornRead`
+  unfalsifiable.
+- **Reader**: load `seq`; retry if odd; load every payload word; load `seq`
+  again; retry if it differs; otherwise accept.
+- **Round `k` stores `k` into every word**, so "some single writer round's
+  complete payload" is an equality rather than a paraphrase.
+
+| Invariant | Establishes |
+|---|---|
+| `NoTornRead` | **The gate's sentence, transcribed.** Every value a reader *returns* is some single writer round's complete payload. Stated over what was **accepted**, never over what was loaded — a torn raw snapshot is not a defect, it is the state the retry exists for, and `shm_lease_seqlock_torn_probe.cfg` requires it to be reachable. |
+| `AcceptedMatchesCounter` | **Sharper than the gate asks for**, and it is what a seqlock actually promises: a snapshot validated against counter value *v* is exactly the payload of the round *v* **names**, not merely of some round. What makes it true is **counter monotonicity**, which the spec never states — see Finding 7. |
+| `WriterAlwaysEnabled` | **A writer never blocks on a reader**, as a state predicate: at every reachable state a writer with work left has a step it can take. An `ENABLED` invariant, so it is checked rather than argued from the shape of the guards. |
+| `ReaderAlwaysEnabled` | The spec's separate demand — *"No reader may block, and no reader may fail"*. A reader that has not finished always has a step; it may have to **retry**, but it never waits. |
+| `SeqParityMatchesRound` | The even-odd discipline itself: the counter is odd **exactly** while a round is in flight. This is what a reader's parity test is entitled to conclude. False under `WriterOrdered = FALSE`, which is why that configuration does not list it. |
+| `AcceptedSeqEven` | A reader never accepts a snapshot it validated against an **odd** counter. |
+| `ReaderTerminates` (liveness) | **Reader termination under a writer that eventually stops.** No reader retries forever. |
+| `WriterFinishes` (liveness) | Checked under **both** specs. Under `Spec` it is unremarkable; under `SpecWriterOnly`, where readers are given **no fairness at all** and may simply stop forever, it is the statement that the writer does not depend on them. |
+
+**Two things this model asserts that the gate did not ask for, and why.**
+`AcceptedMatchesCounter` was added because "some round's payload" is satisfiable
+by a reader that returns a payload no counter value names; asserting the exact
+round is both stronger and cheaper to state. `ReaderAlwaysEnabled` was added
+because the transport spec's "no reader may block" is a separate promise from
+"no writer may block" and a tier that checked only the second would have left the
+client-side half of §1b unexamined.
+
+**One invariant was REFUTED by TLC and removed, and that is worth recording
+rather than quietly dropping.** An earlier draft asserted
+`NoStaleAcceptAfterQuiescence` — that a reader accepting *after* the writer had
+published its last round must hold that last round. TLC produced a
+counterexample at **depth 27**: a reader that had snapshotted round 2 before the
+final round ran, and validated and accepted it afterwards. **The counterexample
+is correct and the invariant was wrong**: the transport spec permits staleness in
+as many words (*"a stale entry is a slightly worse estimate, never an incorrect
+admission"*), and asserting otherwise would have imposed a recency requirement on
+M13b that its own specification disclaims.
+
 ## The deadlock argument, and what these runs actually show
 
 The spec says: *"Because every claimant takes words ascending, the waits-for
@@ -597,12 +761,17 @@ What stops admission deadlocking is that admission is non-blocking and
 all-or-nothing; the ascending order is what stops the *cycle*, which matters
 because M5's queue-and-grant path will make holding-and-waiting real.
 
-## FINDINGS — six, and they are the most valuable output of this tier
+## FINDINGS — eight, and they are the most valuable output of this tier
 
 Findings 1 and 2 are MV1's, about code that had already shipped. Findings 3, 4,
 5 and 6 are MV2's, about code that **does not exist yet** — which is the whole
 argument for modelling before implementing, so it is worth being concrete about
-what each would have cost to find later.
+what each would have cost to find later. Findings 7 and 8 are MV3's, about the
+published aggregate table, and they are of two different kinds: **7 is a checked
+violation with a required-to-fail configuration behind it; 8 is a gap the
+modelling boundary exposed and NOTHING here checks it.** They are labelled
+accordingly, because a tier that presented them as the same kind of statement
+would be doing exactly what this file exists to prevent.
 
 **This numbering is the only one, and every cross-reference in
 `tla/*.tla`, `tla/*.cfg` and the milestone record uses it.** An earlier draft
@@ -952,6 +1121,75 @@ Note how this interacts with Finding 4: both are instances of the same rule, tha
 a decision and the word that records it must not be separable. Finding 4 is that
 rule applied to the *role transfer*; Finding 6 is it applied to the *arithmetic*.
 
+### Finding 7 (MV3, checked) — the seqlock's correctness rests on the counter NEVER WRAPPING under a reader, and the structures spec does not size it
+
+**`s2 == s1` is evidence that the entry did not change ONLY because the counter
+cannot return to a value it has left. That is a WIDTH requirement, and it is
+nowhere in the specification.**
+
+`shm_lease_seqlock_wrap_MC.cfg` runs the shipped protocol — nothing deleted,
+nothing reordered, the parity test intact — on a counter that wraps at 4. TLC
+violates `NoTornRead` at depth 19 with the seqlock's ABA:
+
+```
+  reader:  s1 <- seq        (0, even -> proceed)
+  reader:  snap[1] <- d1    (2, from round 2)
+  writer:  ...two complete rounds run; seq goes 0,1,2,3,0
+  reader:  snap[2] <- d2    (1, from round 1)   <- torn
+  reader:  s2 <- seq        (0 == s1 -> ACCEPT)
+```
+
+The accepted snapshot is `<<2, 1>>`, which belongs to no round.
+
+**What this does and does not license concluding.** At 32 or 64 bits the wrap is
+not reachable in any real deployment, and this finding is then a statement about
+the *argument* rather than about the code. It becomes reachable the moment the
+counter is **narrowed** — and the table's own specification invites exactly that:
+*"fixed-size entries in a bounded open-addressed table, keyed by a hash of the
+opaque stats key"*. A fixed-size entry is where a 64-bit counter gets packed
+down to 16 bits beside a key hash and a generation, and the person doing the
+packing will be optimising a cache line, not re-deriving a seqlock's soundness
+argument. **M13b must state the counter's width and state that its
+non-wraparound is load-bearing**, in the format contract rather than in a
+comment, because the format is the thing that outlives the reasoning.
+
+The invariant `AcceptedMatchesCounter` is the sharp form of the same point and
+is *stated* as being conditional on `SeqModulus = 0`. That conditionality is the
+finding, written where a reader of the model cannot miss it.
+
+### Finding 8 (MV3, NOT CHECKED — a gap the modelling boundary exposed)
+
+**EVICTION AND REUSE OF AN ENTRY IS A DIFFERENT HAZARD FROM TEARING, AND NO
+MODEL OR LITMUS TEST HERE COVERS IT.**
+
+Stated plainly because it would be easy to read the eight green/failing MV3
+configurations as covering the table, and they do not. The spec gives the table
+**eviction by recency and frequency**, and every model here has exactly one
+entry that is never reused. If `runquotad` evicts an entry and rebinds the slot
+to a *different* stats key while a client is inside its seqlock, the client can
+observe a perfectly **coherent** payload — one round's complete stores, passing
+both halves of validation — that belongs to **another key**. `NoTornRead` is
+green on that behaviour, because nothing tore.
+
+This is not hypothetical bookkeeping: the estimate is an admission input, and the
+consequence of answering with another key's aggregate is an admission decision
+made on the wrong distribution, silently, with no torn read to signal it.
+
+**Two ways out, and M13b must pick one and say which**: keep the key (or its
+hash) *inside* the seqlocked region and re-check it after validation, so a
+rebound slot fails the reader's own check; or make eviction a **round** — bump
+the counter to odd, rebind, bump to even — so that rebinding is indistinguishable
+from an update and the existing retry covers it. The second is cheaper and
+composes with what is already modelled; the first is more obviously correct to a
+reader of the code. Either is fine. Neither happening is not.
+
+**Why this is Finding 8 rather than a model.** Adding eviction to
+`shm_lease_seqlock.tla` means adding a key dimension to every entry and to every
+reader, which is a different model rather than a wider configuration — and it is
+only worth building once M13b has chosen between the two remedies, because the
+model would otherwise be checking a design that does not exist. Recorded here so
+the choice is made deliberately rather than by whoever writes the eviction loop.
+
 ### Two deadlocks the model found in its own first drafts, kept because they are the protocol's real shape
 
 Neither is a defect in a design anyone wrote down — both are places where the
@@ -974,7 +1212,7 @@ movement means "answered". `shm_lease_combine_pub_probe.cfg` is required to
 violate `ProbeDiedMidPublish`, so the fixed model demonstrably still reaches the
 state that broke it.
 
-## The litmus tier (MV1 gate item (c)) — RAN
+## The litmus tier (MV1 gate item (c), extended by MV3) — RAN
 
 **herd7 is not in nixpkgs on aarch64-darwin.** Re-probed 2026-08-17, confirming
 MV1's `:tooling:` record — `herdtools7`, `herdtools`, `herd7`, `litmus7`, `diy`,
@@ -987,8 +1225,8 @@ so GMP's headers and pkg-config file are real build inputs). It took about
 20 minutes including three failed attempts.
 
 Wired as `just verify-litmus`. **`litmus/run-litmus.sh` CHECKS EVERY VERDICT** and
-fails if any test does not produce the required one — necessary because five of
-these sixteen tests are required to be **Allowed**, and a runner that only knew how to
+fails if any test does not produce the required one — necessary because nine of
+these twenty-eight tests are required to be **Allowed**, and a runner that only knew how to
 report "Never" would have silently converted its own controls into passes.
 
 | Test | Model | Required | **RAN** |
@@ -1009,6 +1247,18 @@ report "Never" would have silently converted its own controls into passes.
 | `grant-bump-vs-waiters-FENCED-fix` † | C11 | Never | **Never** |
 | `grant-bump-vs-waiters-aarch64-FENCED` † | AArch64 | Never | **Never** |
 | `grant-bump-vs-waiters-WAITER-FENCE-ONLY-control` † | C11 | **Sometimes** | **Sometimes** |
+| **MV3** `seqlock-publish-vs-read` | C11 | Never | **Never** |
+| **MV3** `seqlock-publish-vs-read-aarch64` | AArch64 | Never | **Never** |
+| **MV3** `seqlock-publish-vs-read-x86` | x86-TSO | Never | **Never** |
+| **MV3** `seqlock-publish-vs-read-RELAXED-control` | C11 | **Sometimes** | **Sometimes** |
+| **MV3** `seqlock-publish-vs-read-aarch64-RELAXED-control` | AArch64 | **Sometimes** | **Sometimes** |
+| **MV3** `seqlock-publish-vs-read-x86-RELAXED-control` | x86-TSO | Never | **Never** |
+| **MV3** `seqlock-recheck-vs-payload` | C11 | Never | **Never** |
+| **MV3** `seqlock-recheck-vs-payload-aarch64` | AArch64 | Never | **Never** |
+| **MV3** `seqlock-recheck-vs-payload-x86` | x86-TSO | Never | **Never** |
+| **MV3** `seqlock-recheck-vs-payload-RELAXED-control` | C11 | **Sometimes** | **Sometimes** |
+| **MV3** `seqlock-recheck-vs-payload-aarch64-RELAXED-control` | AArch64 | **Sometimes** | **Sometimes** |
+| **MV3** `seqlock-recheck-vs-payload-x86-RELAXED-control` | x86-TSO | Never | **Never** |
 
 † Added 2026-08-18 with the fix for Finding 2. The three `-FENCED*` rows
 (`-FENCED-fix`, `-x86-FENCED`, `-aarch64-FENCED`) pin the pair the source now
@@ -1020,7 +1270,11 @@ paragraph said they were.** A `.litmus` file is a standalone program: herd7's
 verdict is a deterministic function of that file alone, so *no* edit to the Nim
 source can move it. Deleting `fullFence()` from `waitword.nim` and re-running
 leaves all sixteen verdicts unchanged and `just verify-litmus` green — checked by
-doing exactly that on 2026-08-18. What these rows pin is the **intended shape**,
+doing exactly that on 2026-08-18, when the tier had sixteen tests. MV3's twelve
+are of the same kind and no source edit can move them either; the difference is
+that they pin a structure `src/` does not contain at all, so there is not even a
+review obligation to keep in step — there is a *specification* obligation, and it
+is on M13b. What these rows pin is the **intended shape**,
 and keeping the source in step with the models is a **review obligation** at this
 tier, not an automated one.
 
@@ -1041,6 +1295,51 @@ The `WAITER-FENCE-ONLY` control is what licenses the shipped
 answer is that a waiter-side fence with an unfenced publisher leaves the lost
 wakeup **reachable** — the waiter's seq-cst RMW already orders its own side, and
 the reordering that loses the wakeup is the publisher's.
+
+### MV3's two pairs, as a verdict PER MEMORY MODEL
+
+MV3's gate asks for this shape rather than a summary verdict, and gives the
+reason: *"M3's lost wakeup was Forbidden on ARMv8 and Allowed on the other two,
+and a single verdict would have hidden it."* Here it is for the seqlock, with
+the shipped shape and its relaxed control side by side.
+
+**PAIR (a) — the writer's payload stores against its bump-to-even, versus the
+reader's seq load against its payload loads.**
+
+| | C11 | x86-TSO | ARMv8 |
+|---|---|---|---|
+| shipped: relaxed payload stores, **release** store of `seq`; **acquire** load of `seq`, relaxed payload loads | **Forbidden** | **Forbidden** | **Forbidden** |
+| relaxed control: the same code with both annotations dropped | **Allowed** | **Forbidden** | **Allowed** |
+
+**PAIR (b) — the reader's SECOND seq load against its payload loads.**
+
+| | C11 | x86-TSO | ARMv8 |
+|---|---|---|---|
+| shipped: **acquire fence** between the payload loads and the second `seq` load | **Forbidden** | **Forbidden** | **Forbidden** |
+| relaxed control: the fence deleted, **writer unchanged and still fully fenced** | **Allowed** | **Forbidden** | **Allowed** |
+
+**Read the middle column.** Both defects are **invisible on x86-TSO** and live on
+ARMv8. A seqlock written without either ordering is correct on every machine
+anyone is likely to develop on and wrong on the one `runquotad` ships to, and no
+amount of x86 stress will say so. That is the same trap
+`grant-payload-publish-*-RELAXED-control` states for MV1's publish pair, and MV3
+is the second structure in this repo to walk into it.
+
+**Pair (b) is the sharper of the two and its control is constructed to prove
+it.** In `seqlock-recheck-vs-payload-*-RELAXED-control` the **writer is
+unchanged** — both release fences intact, the publish side perfect — and the torn
+read is bought *entirely* by the missing acquire fence in front of the reader's
+second counter load. So the Allowed verdict cannot be blamed on the publish side,
+and the ordering the reader needs is between **two loads of its own**, with
+nothing in the source to suggest they may not be swapped. This is the pair a
+hand-written seqlock most often gets wrong, and it is why the four-line
+description in the structures spec is a sketch: it says "reader retries on an odd
+or changed count" and there is no place in that sentence for a fence.
+
+**The corresponding model configuration is `shm_lease_seqlock_hoist_MC.cfg`**,
+and the two artefacts answer different questions. The model shows the retry's
+correctness *depends* on the ordering; herd7 shows *which architectures supply
+it*. Neither substitutes for the other.
 
 ### The controls are the point, and one of them is a lesson
 
@@ -1158,15 +1457,41 @@ between a reservation and a combiner that dies mid-round is checked by NEITHER
 model.** A model with both is the right thing to build before M7 puts reclamation
 on the ledger entry.
 
-Thirty-four configurations in total: **12 green** and **22 required to fail**,
-which is the whole set `just verify` runs.
-- `litmus/*.litmus` — 16 herd7 tests across the C11, x86-TSO and AArch64 models:
+- `tla/shm_lease_seqlock.tla` — **MV3**, and the second model here of a structure
+  that does not exist yet: the published aggregate table's **per-entry seqlock**,
+  which is `runquotad`'s and not this repo's. Writer bump-to-odd, per-word
+  payload stores, bump-to-even; reader seq load, parity test, per-word payload
+  loads, seq re-load, retry. Every payload word is its own step on both sides,
+  because a one-word entry cannot tear and would make `NoTornRead` unfalsifiable.
+  Constants `WriterOrdered`, `ReaderChecksParity`, `ReaderRechecks`,
+  `ReaderOrdered`, `WriterWaitsForReaders` and `SeqModulus` select the shipped
+  protocol or one of five mutations. Two specs: `Spec` (weak fairness for
+  everyone) and `SpecWriterOnly` (weak fairness for the **writer alone**, which
+  is how "a writer never blocks on a reader" is stated).
+- `tla/shm_lease_seqlock_MC.tla` + 12 cfgs — 3 green (2 readers over a 2-word
+  entry; a 3-word entry; and the writer finishing with readers given no
+  fairness), 2 non-vacuity probes and 7 required-to-fail configurations, one of
+  which is Finding 7.
+
+**Fifty-two TLC configurations in total: 16 green and 36 required to fail**,
+which is the whole set `just verify` runs — 13 green and 27 required-to-fail
+before MV3, plus MV3's 3 and 9. (The line that stood here read "thirty-four
+configurations in total: 12 green and 22 required to fail". That was MV1+MV2's
+count and was never updated when M6 and M7 added theirs; it was already wrong by
+one green and five negatives before MV3 touched it. Counted from the `Justfile`
+recipes, which are the authority: `verify-tla` runs 15 green configurations,
+`verify-tla-negative` runs 36 through `expect_violation` plus one green
+`claim_ord_nocheck_safety` run at its tail.)
+- `litmus/*.litmus` — 28 herd7 tests across the C11, x86-TSO and AArch64 models:
   the grant-payload publish pair and its relaxed controls on all three models, the
   publish-before-write pair, RMW atomicity, the `:first_target:` store-load pair
   (both remedies), and — added with the fix — the three tests that pin the SHIPPED
   fenced pair on all three models plus the waiter-fence-only control.
-  (13 of these are MV1's own; the last three landed with the Finding 2 fix.)
+  (13 of these are MV1's own; three landed with the Finding 2 fix; the last
+  twelve are **MV3**'s — two seqlock ordering pairs, each on all three models in
+  both the shipped and the relaxed shape, which is what makes the per-model
+  verdict tables above complete rather than selective.)
 - `litmus/run-litmus.sh` — runs them and **checks every verdict**, including the
-  five that must be *Allowed*.
+  nine that must be *Allowed*.
 - `litmus/get-herd7.sh` — builds herdtools7 7.58 through opam where nixpkgs has no
   package for it, which is the case on aarch64-darwin.

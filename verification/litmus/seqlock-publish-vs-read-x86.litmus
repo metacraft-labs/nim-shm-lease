@@ -1,0 +1,23 @@
+X86 seqlock-publish-vs-read-x86
+(*
+ * MV3 PAIR (a) ON x86-TSO, SHIPPED SHAPE.
+ *
+ * On TSO a release store and an acquire load are PLAIN MOVs -- the compiler emits
+ * no barrier for either -- so this file and
+ * `seqlock-publish-vs-read-x86-RELAXED-control.litmus` are the SAME PROGRAM.
+ * They are kept as two files because the table in ../README.md records a verdict
+ * per memory model for the shipped shape AND for the relaxed one, and collapsing
+ * the two rows here would hide the fact that on this architecture the annotations
+ * make no difference at all.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **FORBIDDEN / "Never"** -- TSO keeps stores in
+ * program order and loads in program order, so neither reordering the reader
+ * needs is available.
+ *)
+{ seq=0; d1=0; d2=0; }
+ P0                 | P1                 ;
+ MOV [seq],$1       | MOV EAX,[seq]      ;
+ MOV [d1],$1        | MOV EBX,[d1]       ;
+ MOV [d2],$1        | MOV ECX,[d2]       ;
+ MOV [seq],$2       |                    ;
+exists (1:EAX=2 /\ (1:EBX=0 \/ 1:ECX=0))

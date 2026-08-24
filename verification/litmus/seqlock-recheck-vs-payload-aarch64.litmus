@@ -1,0 +1,28 @@
+AArch64 seqlock-recheck-vs-payload-aarch64
+(*
+ * MV3 PAIR (b) ON THE HARDWARE MODEL. The reader's acquire fence is `DMB ISHLD`
+ * (load-load / load-store), which is what `atomic_thread_fence(acquire)`
+ * compiles to on AArch64; the writer's release fences are `DMB ISH`.
+ *
+ * The `exists` clause: the reader's two seq loads BOTH read 0 -- so its
+ * validation passes -- while a payload word it returns is round 1's. Its
+ * validating load beat the data it was validating.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **FORBIDDEN / "Never"**. Delete the
+ * `DMB ISHLD` and it becomes ALLOWED -- see
+ * `seqlock-recheck-vs-payload-aarch64-RELAXED-control.litmus`. One instruction.
+ *)
+{
+0:X0=seq; 0:X1=d1; 0:X2=d2;
+1:X0=seq; 1:X1=d1; 1:X2=d2;
+}
+ P0             | P1            ;
+ MOV W5,#1      | LDAR W3,[X0]  ;
+ STR W5,[X0]    | LDR W4,[X1]   ;
+ DMB ISH        | LDR W5,[X2]   ;
+ STR W5,[X1]    | DMB ISHLD     ;
+ STR W5,[X2]    | LDR W6,[X0]   ;
+ DMB ISH        |               ;
+ MOV W6,#2      |               ;
+ STR W6,[X0]    |               ;
+exists (1:X3=0 /\ 1:X6=0 /\ (1:X4=1 \/ 1:X5=1))

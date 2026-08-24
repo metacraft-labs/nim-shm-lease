@@ -1,0 +1,21 @@
+X86 seqlock-recheck-vs-payload-x86-RELAXED-control
+(*
+ * THE CONCEALMENT, FOR PAIR (b). Byte-for-byte the same defective reader as
+ * `seqlock-recheck-vs-payload-aarch64-RELAXED-control.litmus`, which is
+ * ALLOWED.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **FORBIDDEN / "Never"**.
+ *
+ * A seqlock reader missing its acquire fence is CORRECT on x86-TSO and WRONG on
+ * ARMv8. This is why MV3's gate demands a verdict per memory model: one summary
+ * verdict over these three files would read "Sometimes" and say nothing about
+ * WHERE, and a summary verdict over M3's lost-wakeup pair concealed the mirror
+ * image of exactly this.
+ *)
+{ seq=0; d1=0; d2=0; }
+ P0                 | P1                 ;
+ MOV [seq],$1       | MOV EAX,[seq]      ;
+ MOV [d1],$1        | MOV EBX,[d1]       ;
+ MOV [d2],$1        | MOV ECX,[d2]       ;
+ MOV [seq],$2       | MOV EDX,[seq]      ;
+exists (1:EAX=0 /\ 1:EDX=0 /\ (1:EBX=1 \/ 1:ECX=1))

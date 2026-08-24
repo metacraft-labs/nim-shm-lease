@@ -1,0 +1,24 @@
+X86 seqlock-publish-vs-read-x86-RELAXED-control
+(*
+ * THE OTHER HALF OF THE TRAP, AND THE REASON MV3'S GATE DEMANDS A VERDICT PER
+ * MEMORY MODEL RATHER THAN ONE SUMMARY VERDICT.
+ *
+ * This is byte-for-byte the same defective seqlock as
+ * `seqlock-publish-vs-read-aarch64-RELAXED-control.litmus`, which is ALLOWED,
+ * and the same program as `seqlock-publish-vs-read-x86.litmus`, because on TSO
+ * the release/acquire annotations compile to nothing.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **FORBIDDEN / "Never"**.
+ *
+ * So a relaxed publish in the aggregate table is UNDETECTABLE BY ANY AMOUNT OF
+ * x86 TESTING and unsound on ARMv8. M3's lost wakeup was the mirror image of
+ * this -- Forbidden on ARMv8, Allowed on the other two -- and a single summary
+ * verdict would have concealed either one.
+ *)
+{ seq=0; d1=0; d2=0; }
+ P0                 | P1                 ;
+ MOV [seq],$1       | MOV EAX,[seq]      ;
+ MOV [d1],$1        | MOV EBX,[d1]       ;
+ MOV [d2],$1        | MOV ECX,[d2]       ;
+ MOV [seq],$2       |                    ;
+exists (1:EAX=2 /\ (1:EBX=0 \/ 1:ECX=0))

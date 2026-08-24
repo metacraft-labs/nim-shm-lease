@@ -1,0 +1,27 @@
+AArch64 seqlock-publish-vs-read-aarch64
+(*
+ * MV3 PAIR (a) ON THE HARDWARE MODEL THE DAEMON AND ITS CLIENTS ACTUALLY RUN ON.
+ *
+ * The bump back to EVEN is a RELEASE store -> STLR; the reader's first seq load
+ * is an ACQUIRE load -> LDAR. The payload stores and loads are plain.
+ *
+ * The `exists` clause is the reader that observed the published counter (2) and
+ * a payload word from before the round -- a torn aggregate that passed
+ * validation.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **FORBIDDEN / "Never"**. The
+ * `-RELAXED-control` companion is ALLOWED on this same model, so the STLR/LDAR
+ * pair is load-bearing rather than decorative.
+ *)
+{
+0:X0=seq; 0:X1=d1; 0:X2=d2;
+1:X0=seq; 1:X1=d1; 1:X2=d2;
+}
+ P0             | P1            ;
+ MOV W5,#1      | LDAR W3,[X0]  ;
+ STR W5,[X0]    | LDR W4,[X1]   ;
+ STR W5,[X1]    | LDR W5,[X2]   ;
+ STR W5,[X2]    |               ;
+ MOV W6,#2      |               ;
+ STLR W6,[X0]   |               ;
+exists (1:X3=2 /\ (1:X4=0 \/ 1:X5=0))

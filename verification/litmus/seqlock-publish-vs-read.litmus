@@ -1,0 +1,51 @@
+C seqlock-publish-vs-read
+(*
+ * MV3 PAIR (a): THE WRITER'S PAYLOAD STORES AGAINST ITS BUMP-TO-EVEN, VERSUS
+ * THE READER'S SEQ LOAD AGAINST ITS PAYLOAD LOADS.
+ *
+ * This is the pair the published aggregate table's seqlock rests on for the
+ * PUBLISH direction. RunQuota-Shared-Memory-Structures.md SS"Structures Not Yet
+ * Built" specifies it in six words -- "release-store to publish" -- and this
+ * file is what those six words have to forbid.
+ *
+ *     runquotad (writer)                | client (reader)
+ *     seq  <- 1        (odd, relaxed)   | r0 <- seq   (ACQUIRE)
+ *     d1   <- 1        (relaxed)        | r1 <- d1    (relaxed)
+ *     d2   <- 1        (relaxed)        | r2 <- d2    (relaxed)
+ *     seq  <- 2        (even, RELEASE)  |
+ *
+ * TWO payload words, deliberately. A one-word entry cannot tear, and a litmus
+ * test for a structure whose whole purpose is multi-word atomicity must be able
+ * to express the partial observation.
+ *
+ * The `exists` clause is a reader that observed the PUBLISHED counter -- the
+ * even value that says "round 1 is complete and stable" -- and then read a
+ * payload word from BEFORE round 1. That reader passes both halves of its own
+ * validation and returns a torn aggregate, which is the failure MV3 exists to
+ * exclude.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **FORBIDDEN / "Never"**, and the
+ * `-RELAXED-control` companion is ALLOWED -- so the verdict is bought by the
+ * release/acquire pair rather than coming free. Per-model verdicts, which is
+ * the whole point of running three: C11 Never, ARMv8 Never, x86-TSO Never.
+ *)
+{
+  seq = 0;
+  d1 = 0;
+  d2 = 0;
+}
+
+P0 (atomic_int *seq, atomic_int *d1, atomic_int *d2) {
+  atomic_store_explicit(seq, 1, memory_order_relaxed);
+  atomic_store_explicit(d1, 1, memory_order_relaxed);
+  atomic_store_explicit(d2, 1, memory_order_relaxed);
+  atomic_store_explicit(seq, 2, memory_order_release);
+}
+
+P1 (atomic_int *seq, atomic_int *d1, atomic_int *d2) {
+  int r0 = atomic_load_explicit(seq, memory_order_acquire);
+  int r1 = atomic_load_explicit(d1, memory_order_relaxed);
+  int r2 = atomic_load_explicit(d2, memory_order_relaxed);
+}
+
+exists (1:r0 = 2 /\ (1:r1 = 0 \/ 1:r2 = 0))

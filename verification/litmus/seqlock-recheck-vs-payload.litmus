@@ -1,0 +1,66 @@
+C seqlock-recheck-vs-payload
+(*
+ * MV3 PAIR (b): THE READER'S **SECOND** SEQ LOAD AGAINST ITS PAYLOAD LOADS --
+ * "the pair a compiler or a weak model may sink, and the one a hand-written
+ * seqlock most often gets wrong".
+ *
+ * Pair (a) is about the WRITER publishing in order. This one is about the
+ * READER validating in order, and it is the harder half because the ordering it
+ * needs is between TWO LOADS OF THE READER'S OWN, with nothing in the source to
+ * suggest they may not be swapped. A seqlock written as
+ *
+ *     s1 = seq; if (s1 & 1) retry;
+ *     memcpy(&out, entry, sizeof out);
+ *     if (seq != s1) retry;          // <-- nothing orders this against the copy
+ *
+ * is the sketch MV3 says is not an implementation. The load of `seq` in the last
+ * line may be issued BEFORE the copy completes -- by the hardware on ARMv8, and
+ * by the compiler on any target, since a relaxed atomic load may be moved ahead
+ * of non-atomic reads.
+ *
+ *     runquotad (writer)                | client (reader)
+ *     seq <- 1     (odd, relaxed)       | r0 <- seq       (ACQUIRE)
+ *     fence(release)                    | r1 <- d1        (relaxed)
+ *     d1  <- 1     (relaxed)            | r2 <- d2        (relaxed)
+ *     d2  <- 1     (relaxed)            | fence(ACQUIRE)  <-- THE PAIR
+ *     fence(release)                    | r3 <- seq       (relaxed)
+ *     seq <- 2     (even, relaxed)      |
+ *
+ * The writer uses release FENCES rather than a release store because the reader
+ * must be able to conclude something from BOTH counter values; this is the
+ * standard C11 seqlock (Boehm, "Can seqlocks get along with programming
+ * language memory models?", MSPC 2012) and it is what M13b should be written as.
+ *
+ * The `exists` clause is the defect: the reader's two seq loads AGREE (0 and 0,
+ * even, so its validation passes) while a payload word it returns came from
+ * round 1. The counter it validated against was read before the data it is
+ * validating.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **FORBIDDEN / "Never"**. Per model: C11
+ * Never, ARMv8 Never, x86-TSO Never. The `-RELAXED-control` companions are
+ * ALLOWED on C11 and on ARMv8 and FORBIDDEN on x86-TSO.
+ *)
+{
+  seq = 0;
+  d1 = 0;
+  d2 = 0;
+}
+
+P0 (atomic_int *seq, atomic_int *d1, atomic_int *d2) {
+  atomic_store_explicit(seq, 1, memory_order_relaxed);
+  atomic_thread_fence(memory_order_release);
+  atomic_store_explicit(d1, 1, memory_order_relaxed);
+  atomic_store_explicit(d2, 1, memory_order_relaxed);
+  atomic_thread_fence(memory_order_release);
+  atomic_store_explicit(seq, 2, memory_order_relaxed);
+}
+
+P1 (atomic_int *seq, atomic_int *d1, atomic_int *d2) {
+  int r0 = atomic_load_explicit(seq, memory_order_acquire);
+  int r1 = atomic_load_explicit(d1, memory_order_relaxed);
+  int r2 = atomic_load_explicit(d2, memory_order_relaxed);
+  atomic_thread_fence(memory_order_acquire);
+  int r3 = atomic_load_explicit(seq, memory_order_relaxed);
+}
+
+exists (1:r0 = 0 /\ 1:r3 = 0 /\ (1:r1 = 1 \/ 1:r2 = 1))

@@ -5,8 +5,8 @@
 # This is not a "look at the output" script. Every test below has a REQUIRED
 # verdict and the script fails if any test does not produce it, because half of
 # these tests are required to be ALLOWED and a suite that only knows how to
-# report "Never" would silently turn its own controls into passes. Of the sixteen
-# tests below, FIVE are required to be ALLOWED.
+# report "Never" would silently turn its own controls into passes. Of the
+# twenty-eight tests below, NINE are required to be ALLOWED.
 #
 #   Never     = the outcome is forbidden by the model
 #   Sometimes = the outcome is permitted by the model
@@ -59,6 +59,28 @@ expect_never=(
   grant-bump-vs-waiters-aarch64
   # The same relaxed message passing that is BUGGY on ARM is invisible on x86.
   grant-payload-publish-x86-RELAXED-control
+  # ---- MV3: THE PUBLISHED AGGREGATE TABLE'S SEQLOCK, modelled before M13b
+  # writes it. Two pairs, three memory models each, shipped shape and relaxed
+  # control -- twelve verdicts, and the gate asks for them PER MODEL rather than
+  # as one summary, because M3's lost wakeup was Forbidden on ARMv8 and Allowed
+  # on the other two and a summary would have hidden it.
+  #
+  # PAIR (a): the writer's payload stores against its bump-to-even, versus the
+  # reader's seq load against its payload loads. The publish direction.
+  seqlock-publish-vs-read
+  seqlock-publish-vs-read-aarch64
+  seqlock-publish-vs-read-x86
+  # The relaxed publish is ALLOWED on C11 and ARMv8 (below) and FORBIDDEN here:
+  # the defect is invisible to any amount of x86 testing.
+  seqlock-publish-vs-read-x86-RELAXED-control
+  #
+  # PAIR (b): the reader's SECOND seq load against its payload loads -- the pair
+  # a compiler or a weak model may sink, and the one a hand-written seqlock most
+  # often gets wrong.
+  seqlock-recheck-vs-payload
+  seqlock-recheck-vs-payload-aarch64
+  seqlock-recheck-vs-payload-x86
+  seqlock-recheck-vs-payload-x86-RELAXED-control
 )
 
 expect_sometimes=(
@@ -77,6 +99,16 @@ expect_sometimes=(
   # lost wakeup reachable. This is what licenses the shipped asymmetry (no fence
   # in `waitOn`) instead of copying obsring's both-sides pairing by reflex.
   grant-bump-vs-waiters-WAITER-FENCE-ONLY-control
+  # ---- MV3's REQUIRED-TO-FAIL CONTROLS, and the tier is not evidence without
+  # them: the gate says "a relaxed variant of EACH pair MUST produce the torn
+  # read under at least one of C11/ARMv8". Both pairs, both models, four files.
+  seqlock-publish-vs-read-RELAXED-control
+  seqlock-publish-vs-read-aarch64-RELAXED-control
+  # The reader-side one is the sharper of the two: its WRITER IS FULLY FENCED,
+  # so the torn read is bought entirely by the missing acquire fence in front of
+  # the reader's second counter load.
+  seqlock-recheck-vs-payload-RELAXED-control
+  seqlock-recheck-vs-payload-aarch64-RELAXED-control
 )
 
 fail=0

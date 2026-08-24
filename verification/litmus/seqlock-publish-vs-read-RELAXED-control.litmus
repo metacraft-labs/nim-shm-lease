@@ -1,0 +1,33 @@
+C seqlock-publish-vs-read-RELAXED-control
+(*
+ * REQUIRED-TO-FAIL CONTROL for `seqlock-publish-vs-read.litmus`, and the reason
+ * that test means anything: identical shape with the release store and the
+ * acquire load DOWNGRADED TO RELAXED. This is the seqlock a developer writes
+ * when "the counter is atomic" is mistaken for "the counter is ordered".
+ *
+ * MV3's gate requires this: "a relaxed variant of EACH pair MUST produce the
+ * torn read under at least one of C11/ARMv8".
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **ALLOWED / "Sometimes"**. The reader
+ * observes the published even counter and a payload word from before the round.
+ *)
+{
+  seq = 0;
+  d1 = 0;
+  d2 = 0;
+}
+
+P0 (atomic_int *seq, atomic_int *d1, atomic_int *d2) {
+  atomic_store_explicit(seq, 1, memory_order_relaxed);
+  atomic_store_explicit(d1, 1, memory_order_relaxed);
+  atomic_store_explicit(d2, 1, memory_order_relaxed);
+  atomic_store_explicit(seq, 2, memory_order_relaxed);
+}
+
+P1 (atomic_int *seq, atomic_int *d1, atomic_int *d2) {
+  int r0 = atomic_load_explicit(seq, memory_order_relaxed);
+  int r1 = atomic_load_explicit(d1, memory_order_relaxed);
+  int r2 = atomic_load_explicit(d2, memory_order_relaxed);
+}
+
+exists (1:r0 = 2 /\ (1:r1 = 0 \/ 1:r2 = 0))

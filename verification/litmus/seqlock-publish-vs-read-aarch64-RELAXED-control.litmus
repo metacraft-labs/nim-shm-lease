@@ -1,0 +1,27 @@
+AArch64 seqlock-publish-vs-read-aarch64-RELAXED-control
+(*
+ * REQUIRED-TO-FAIL CONTROL for `seqlock-publish-vs-read-aarch64.litmus`:
+ * the STLR becomes a plain STR and the LDAR a plain LDR. Everything else is
+ * identical, so the two files differ by exactly two instructions.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **ALLOWED / "Sometimes"**. On ARMv8 the
+ * unordered publish really does let a reader see the even counter with a stale
+ * payload word.
+ *
+ * READ THIS TOGETHER WITH `seqlock-publish-vs-read-x86-RELAXED-control.litmus`,
+ * which is the SAME defective code and is FORBIDDEN on x86-TSO. A seqlock
+ * written this way is correct on every machine anyone is likely to develop on
+ * and wrong on the one this ships to.
+ *)
+{
+0:X0=seq; 0:X1=d1; 0:X2=d2;
+1:X0=seq; 1:X1=d1; 1:X2=d2;
+}
+ P0             | P1            ;
+ MOV W5,#1      | LDR W3,[X0]   ;
+ STR W5,[X0]    | LDR W4,[X1]   ;
+ STR W5,[X1]    | LDR W5,[X2]   ;
+ STR W5,[X2]    |               ;
+ MOV W6,#2      |               ;
+ STR W6,[X0]    |               ;
+exists (1:X3=2 /\ (1:X4=0 \/ 1:X5=0))

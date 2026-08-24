@@ -1,0 +1,19 @@
+X86 seqlock-recheck-vs-payload-x86
+(*
+ * MV3 PAIR (b) ON x86-TSO, SHIPPED SHAPE. The reader's acquire fence is a
+ * COMPILER barrier only on TSO -- it emits no instruction -- so this file is the
+ * same program as `seqlock-recheck-vs-payload-x86-RELAXED-control.litmus`, and
+ * both are here so the per-model table in ../README.md has a cell for the
+ * shipped shape as well as for the relaxed one.
+ *
+ * RESULT (herd7 7.58, 2026-08-24): **FORBIDDEN / "Never"**. TSO does not
+ * reorder loads with loads, so the reader's second counter load cannot precede
+ * its payload reads.
+ *)
+{ seq=0; d1=0; d2=0; }
+ P0                 | P1                 ;
+ MOV [seq],$1       | MOV EAX,[seq]      ;
+ MOV [d1],$1        | MOV EBX,[d1]       ;
+ MOV [d2],$1        | MOV ECX,[d2]       ;
+ MOV [seq],$2       | MOV EDX,[seq]      ;
+exists (1:EAX=0 /\ 1:EDX=0 /\ (1:EBX=1 \/ 1:ECX=1))
