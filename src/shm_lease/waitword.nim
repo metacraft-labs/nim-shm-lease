@@ -637,6 +637,14 @@ static int shmLeaseWwWake(void *addr, int all, int shared, int *errOut) {
     let ps = int(sysconf(SC_PAGESIZE))
     if ps > 0: ps else: 4096
 
+  proc allocationGranularity*(): int {.inline.} =
+    ## The alignment a CHOSEN mapping base must have. On POSIX that is the
+    ## page size, because `mmap(MAP_FIXED)` wants a page-aligned address; the
+    ## name exists because on Windows it is NOT the page size (see the
+    ## portable arm below), and a caller that strides differing-base probes
+    ## by `pageSize()` there fails with `ERROR_MAPPED_ALIGNMENT`.
+    pageSize()
+
   proc waitSegmentSize*(slotCount: int): int =
     let raw = WaitSegHeaderSize + slotCount * WaitSlotSize
     let ps = pageSize()
@@ -950,7 +958,45 @@ else:
     WwErrNoWaiters* = cint(0)
 
   proc waitWordAvailable*(): bool = false
-  proc pageSize*(): int = 4096
+  when defined(windows):
+    # THE WAIT PRIMITIVE IS UNAVAILABLE HERE; THE GEOMETRY IS NOT. A segment
+    # that does not park -- the published stats table is one -- still needs
+    # the page size and, for a chosen base, the allocation granularity, and
+    # both are asked of the system rather than assumed. They differ: 4 KiB
+    # pages, 64 KiB granularity (structures spec, "Shared memory and the
+    # alignment hazard").
+    type SystemInfo {.pure.} = object
+      processorArchitecture: uint16
+      reserved: uint16
+      pageSize: uint32
+      minimumApplicationAddress: pointer
+      maximumApplicationAddress: pointer
+      activeProcessorMask: uint
+      numberOfProcessors: uint32
+      processorType: uint32
+      allocationGranularity: uint32
+      processorLevel: uint16
+      processorRevision: uint16
+
+    proc getSystemInfo(info: var SystemInfo) {.
+      stdcall, dynlib: "kernel32.dll", importc: "GetSystemInfo".}
+
+    proc pageSize*(): int =
+      var info: SystemInfo
+      getSystemInfo(info)
+      if info.pageSize > 0'u32: int(info.pageSize) else: 4096
+
+    proc allocationGranularity*(): int =
+      ## `dwAllocationGranularity`: what `MapViewOfFileEx` requires of a
+      ## chosen base address and of a mapping offset. 64 KiB, and NOT the
+      ## page size.
+      var info: SystemInfo
+      getSystemInfo(info)
+      if info.allocationGranularity > 0'u32: int(info.allocationGranularity)
+      else: 65536
+  else:
+    proc pageSize*(): int = 4096
+    proc allocationGranularity*(): int = 4096
   proc waitSegmentSize*(slotCount: int): int =
     WaitSegHeaderSize + slotCount * WaitSlotSize
   proc waitWordValue*(base: ShmBase; off: int): uint32 = 0
