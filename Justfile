@@ -39,6 +39,8 @@ build:
     nim c {{nim-flags}} {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease tests/test_shm_lease.nim 2>&1 | tee test-logs/build.log
     nim c {{nim-flags}} {{src-paths}} -d:release \
+        -o:test-logs/test_shm_lease_anchor tests/test_shm_lease_anchor.nim 2>&1 | tee -a test-logs/build.log
+    nim c {{nim-flags}} {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_multiprocess \
         tests/test_shm_lease_multiprocess.nim 2>&1 | tee -a test-logs/build.log
     nim c {{nim-flags}} {{src-paths}} -d:release \
@@ -76,7 +78,7 @@ build:
 test: test-unit test-integration test-waitword test-wait-integration \
       test-fence-shape test-obsring test-obs-integration test-arbiter \
       test-arbiter-integration test-starvation test-hooks test-reclaim \
-      test-kill-injection
+      test-kill-injection test-anchor
 
 # Unit: packed-budget arithmetic, fixed-claim-order enforcement, boot+pid+start-time
 # anchoring, over-release refusal, and the NEGATIVE controls proving the overcommit
@@ -90,6 +92,18 @@ test-unit:
     mkdir -p test-logs
     nim c -r {{nim-flags}} {{src-paths}} \
         tests/test_shm_lease.nim 2>&1 | tee test-logs/test-unit.log
+
+# The anchor on its own, on EVERY platform that has one -- Windows included,
+# where it is the only part of this library a consumer uses today (runquota's
+# published stats table). Real processes: a child's start time read by the
+# child and by the parent, a boot id compared across processes, and an exited
+# owner judged both while its process object is still held and after.
+test-anchor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p test-logs
+    nim c -r {{nim-flags}} {{src-paths}} \
+        tests/test_shm_lease_anchor.nim 2>&1 | tee test-logs/test-anchor.log
 
 # Integration: THE M2 GATE. N real processes claim/release multi-dimensional
 # reservations against one shared packed budget, each mapping the segment at a
@@ -362,6 +376,7 @@ lint-nim:
     mkdir -p test-logs
     nim check {{nim-flags}} {{src-paths}} src/shm_lease.nim 2>&1 | tee test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_anchor.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_waitword.nim 2>&1 | tee -a test-logs/lint-nim.log
     nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log

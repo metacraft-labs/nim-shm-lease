@@ -151,6 +151,27 @@ Per the design spec's _"The engineering playbook does transfer"_:
 | macOS 11+ (arm64, x86-64) | supported                     | process start time via `sysctl(KERN_PROC/KERN_PROC_PID)` → `kp_proc.p_starttime`; boot identity derived from pid 1's start time                                                                                                                                                                                                                                                            |
 | Windows                   | **not supported** — no-op arm | Deliberate, and inherited from the campaign: the shared-memory transport's Windows _wake_ path needs named kernel objects because `WaitOnAddress` is documented as within-process only. The M2 reservation itself would port, but shipping it without M3's wake path would be a half-capability, so Windows reports unavailable and the gap is recorded here rather than silently omitted. |
 
+### The anchor on its own
+
+The anchor is the one part of this library a consumer uses on Windows today --
+`runquota`'s published stats table records its publisher's anchor in the
+segment header and judges it with `anchorVerdict` -- so it has a Windows arm
+of its own, ahead of the segments that carry it there.
+`tests/test_shm_lease_anchor.nim` (`just test-anchor`) is portable and asserts
+it on every platform with real processes.
+
+| Platform | Boot id | Process start time | pid liveness |
+| -------- | ------- | ------------------ | ------------ |
+| Linux    | `/proc/sys/kernel/random/boot_id` | field 22 of `/proc/<pid>/stat` | `kill(pid, 0)`; `EPERM` is existence |
+| macOS    | pid 1's start time | `sysctl(KERN_PROC_PID)` → `kp_proc.p_starttime` | `kill(pid, 0)`; `EPERM` is existence |
+| Windows  | kernel boot time minus its clock-step bias (`NtQuerySystemInformation(SystemTimeOfDayInformation)`) -- NOT "now minus `GetTickCount64()`", which moves between calls | `GetProcessTimes` creation time | `OpenProcess` + a zero-timeout wait: a process object outlives its process while a handle is held, so a successful open is not proof of life |
+
+The Windows choices, and why the first differs from the design table it
+replaced, are recorded in `reprobuild-specs/RunQuota-Shared-Memory-Structures.md`
+§"Implemented on Windows (added 2026-09-25)". `pageSize()` and the new
+`allocationGranularity()` (the alignment a chosen mapping base needs: 64 KiB on
+Windows, the page size elsewhere) are asked of the system on Windows too.
+
 ### The blocking wrapper (M3)
 
 | Platform                | Primitive                                                                                     | Minimum version | Cross-process | Note                                                                                                                                                                                                                                                                                                                                                       |
