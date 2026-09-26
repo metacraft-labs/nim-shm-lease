@@ -28,6 +28,8 @@ task test, "Build + run the nim-shm-lease test suite":
   # process START TIME), over-release refusal, and the NEGATIVE controls that give
   # the overcommit detector and the stored-pointer checker teeth.
   exec "nim c -r " & nimFlags & siblingPaths() & "tests/test_shm_lease.nim"
+  # Every Nim compile in this checkout keeps its nimcache inside the checkout.
+  exec "nim c -r " & nimFlags & "tests/test_nimcache_is_worktree_local.nim"
   # THE M2 GATE: N real processes claiming/releasing against one shared packed
   # budget, each at a DELIBERATELY DIFFERENT virtual base (MAP_FIXED).
   exec "nim c -r " & nimFlags & siblingPaths() & "tests/test_shm_lease_multiprocess.nim"

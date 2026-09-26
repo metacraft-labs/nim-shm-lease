@@ -19,6 +19,13 @@ alias fmt := format
 # threads); `--path:src` is re-stated because `--skipParentCfg` suppresses
 # `config.nims`.
 nim-flags := "--skipParentCfg --skipUserCfg --hints:off --threads:on --warning:BareExcept:off"
+
+# Per-checkout nimcache (see config.nims): `--skipParentCfg` above switches off
+# the repo-root config that would otherwise keep every cache inside this
+# checkout, so each recipe names its own, in the same layout.  Relative to the
+# recipe working directory (this file's directory).  Nim's default,
+# `~/.cache/nim/<module>_<d|r>`, is shared by every checkout on the machine.
+nimcache := ".nimcache"
 # `--path:../nim-shm-queue/src` is the M4 dependency: the observation ring rides
 # `nim-shm-queue`'s Layer 1 (ticket-CAS append, release-store publish,
 # single-consumer drain, atomic signalled drop counter) rather than growing a
@@ -36,41 +43,41 @@ build:
     # RC=0 masks the failure and the recipe reports success — a false green.
     set -euo pipefail
     mkdir -p test-logs
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease tests/test_shm_lease.nim 2>&1 | tee test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_anchor_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_anchor tests/test_shm_lease_anchor.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_multiprocess_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_multiprocess \
         tests/test_shm_lease_multiprocess.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_waitword_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_waitword \
         tests/test_shm_lease_waitword.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_wait_multiprocess_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_wait_multiprocess \
         tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_obsring_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_obsring \
         tests/test_shm_lease_obsring.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_obs_multiprocess_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_obs_multiprocess \
         tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_arbiter_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_arbiter \
         tests/test_shm_lease_arbiter.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_arbiter_multiprocess_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_arbiter_multiprocess \
         tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_starvation_r {{src-paths}} -d:release \
         -o:test-logs/test_shm_lease_starvation \
         tests/test_shm_lease_starvation.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_hooks_d {{src-paths}} -d:shmLeaseScheduleHooks \
         -o:test-logs/test_shm_lease_hooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_reclaim_d {{src-paths}} \
         -o:test-logs/test_shm_lease_reclaim \
         tests/test_shm_lease_reclaim.nim 2>&1 | tee -a test-logs/build.log
-    nim c {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_kill_injection_d {{src-paths}} -d:shmLeaseScheduleHooks \
         -o:test-logs/test_shm_lease_kill_injection \
         tests/test_shm_lease_kill_injection.nim 2>&1 | tee -a test-logs/build.log
 
@@ -90,8 +97,10 @@ test-unit:
     # `just test` goes green with `[FAILED]` lines in its own output.
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_d {{src-paths}} \
         tests/test_shm_lease.nim 2>&1 | tee test-logs/test-unit.log
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_nimcache_is_worktree_local_d {{src-paths}} \
+        tests/test_nimcache_is_worktree_local.nim 2>&1 | tee -a test-logs/test-unit.log
 
 # The anchor on its own, on EVERY platform that has one -- Windows included,
 # where it is the only part of this library a consumer uses today (runquota's
@@ -102,7 +111,7 @@ test-anchor:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_anchor_d {{src-paths}} \
         tests/test_shm_lease_anchor.nim 2>&1 | tee test-logs/test-anchor.log
 
 # Integration: THE M2 GATE. N real processes claim/release multi-dimensional
@@ -113,7 +122,7 @@ test-integration:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_multiprocess_d {{src-paths}} \
         tests/test_shm_lease_multiprocess.nim 2>&1 | tee test-logs/test-integration.log
 
 # M3 unit: the futex-class blocking wrapper. Capability record, the KERNEL syscall
@@ -124,7 +133,7 @@ test-waitword:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_waitword_d {{src-paths}} \
         tests/test_shm_lease_waitword.nim 2>&1 | tee test-logs/test-waitword.log
 
 # M3 integration: THE M3 GATE. Real processes at DELIBERATELY DIFFERING virtual
@@ -139,7 +148,7 @@ test-wait-integration:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_wait_multiprocess_d {{src-paths}} \
         tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee test-logs/test-wait-integration.log
 
 # THE FENCE-SHAPE BARRIER: disassembles `wakeAll` / `wakeOne` and requires a FULL
@@ -175,7 +184,7 @@ test-obsring:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_obsring_d {{src-paths}} \
         tests/test_shm_lease_obsring.nim 2>&1 | tee test-logs/test-obsring.log
 
 # M4 integration: THE M4 GATE. Real producer processes at DELIBERATELY DIFFERING
@@ -192,7 +201,7 @@ test-obs-integration:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_obs_multiprocess_d {{src-paths}} \
         tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee test-logs/test-obs-integration.log
 
 # M5 unit: THE FLAT-COMBINING ARBITER, against the four constraints MV2 derived
@@ -210,7 +219,7 @@ test-arbiter:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_arbiter_d {{src-paths}} \
         tests/test_shm_lease_arbiter.nim 2>&1 | tee test-logs/test-arbiter.log
 
 # M5 integration: THE M5 GATE. Real processes at DELIBERATELY DIFFERING virtual
@@ -228,7 +237,7 @@ test-arbiter-integration:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_arbiter_multiprocess_r {{src-paths}} -d:release \
         tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | \
         tee test-logs/test-arbiter-integration.log
 
@@ -245,7 +254,7 @@ test-starvation:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_starvation_r {{src-paths}} -d:release \
         tests/test_shm_lease_starvation.nim 2>&1 | \
         tee test-logs/test-starvation.log
 
@@ -263,7 +272,7 @@ test-syscalls:
     #!/usr/bin/env bash
     set -uo pipefail
     mkdir -p test-logs
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_fastpath_r {{src-paths}} -d:release \
         -o:test-logs/probe_fastpath benchmarks/probe_fastpath.nim
     echo "--- in-process kernel counter (always available on macOS) ---"
     ./test-logs/probe_fastpath
@@ -290,7 +299,7 @@ test-hooks:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_hooks_d {{src-paths}} -d:shmLeaseScheduleHooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee test-logs/test-hooks.log
 
 # M7 RECLAMATION (SM-6): a client killed while holding a reservation has it
@@ -302,7 +311,7 @@ test-reclaim:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_reclaim_d {{src-paths}} \
         tests/test_shm_lease_reclaim.nim 2>&1 | tee test-logs/test-reclaim.log
 
 # THE M7 GATE: SIGKILL at EVERY schedule hook, including mid-combine while holding
@@ -315,7 +324,7 @@ test-kill-injection:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_kill_injection_d {{src-paths}} -d:shmLeaseScheduleHooks \
         tests/test_shm_lease_kill_injection.nim 2>&1 | \
         tee test-logs/test-kill-injection.log
 
@@ -332,12 +341,12 @@ test-kill-injection:
 # NOT claimed as passing anywhere. Run this on x86-64 Linux, where the sibling
 # `nim-shm-gset` runs the equivalent recipe.
 test-sanitizers:
-    nim c {{nim-flags}} {{src-paths}} --mm:orc -d:useMalloc --debugger:native \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_hooks_d {{src-paths}} --mm:orc -d:useMalloc --debugger:native \
         -d:shmLeaseScheduleHooks \
         --passc:-fsanitize=thread --passl:-fsanitize=thread \
         -o:test-logs/shmlease-tsan tests/test_shm_lease_hooks.nim
     TSAN_OPTIONS="halt_on_error=1" ./test-logs/shmlease-tsan
-    nim c {{nim-flags}} {{src-paths}} --mm:orc -d:useMalloc --debugger:native \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_d {{src-paths}} --mm:orc -d:useMalloc --debugger:native \
         --passc:"-fsanitize=address,undefined -fno-sanitize-recover=undefined" \
         --passl:"-fsanitize=address,undefined" \
         -o:test-logs/shmlease-asan tests/test_shm_lease.nim
@@ -347,7 +356,7 @@ test-sanitizers:
 # `just soak 60` runs each child for 60x the default round count.
 soak factor="10":
     @mkdir -p test-logs
-    SHM_LEASE_ROUND_FACTOR={{factor}} nim c -r {{nim-flags}} {{src-paths}} -d:release \
+    SHM_LEASE_ROUND_FACTOR={{factor}} nim c -r {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_multiprocess_r {{src-paths}} -d:release \
         -o:test-logs/soak tests/test_shm_lease_multiprocess.nim
 
 # Lint: nim check over the library modules + every test.
@@ -365,7 +374,7 @@ lint-portable-arm:
     # deliberately and requiring this recipe to fail.
     set -euo pipefail
     mkdir -p test-logs
-    nim check --os:windows --cpu:amd64 {{nim-flags}} {{src-paths}} \
+    nim check --os:windows --cpu:amd64 {{nim-flags}} --nimcache:{{nimcache}}/src/shm_lease_check {{src-paths}} \
         src/shm_lease.nim 2>&1 | tee test-logs/lint-portable-arm.log
 
 lint-nim:
@@ -374,36 +383,36 @@ lint-nim:
     # tee's RC=0 masks a failing check — a false green).
     set -euo pipefail
     mkdir -p test-logs
-    nim check {{nim-flags}} {{src-paths}} src/shm_lease.nim 2>&1 | tee test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_anchor.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_waitword.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_arbiter.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_starvation.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/test_shm_lease_reclaim.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/src/shm_lease_check {{src-paths}} src/shm_lease.nim 2>&1 | tee test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_check {{src-paths}} tests/test_shm_lease.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_anchor_check {{src-paths}} tests/test_shm_lease_anchor.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_multiprocess_check {{src-paths}} tests/test_shm_lease_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_waitword_check {{src-paths}} tests/test_shm_lease_waitword.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_wait_multiprocess_check {{src-paths}} tests/test_shm_lease_wait_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_obsring_check {{src-paths}} tests/test_shm_lease_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_obs_multiprocess_check {{src-paths}} tests/test_shm_lease_obs_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_arbiter_check {{src-paths}} tests/test_shm_lease_arbiter.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_arbiter_multiprocess_check {{src-paths}} tests/test_shm_lease_arbiter_multiprocess.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_starvation_check {{src-paths}} tests/test_shm_lease_starvation.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_reclaim_check {{src-paths}} tests/test_shm_lease_reclaim.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_kill_injection_check {{src-paths}} -d:shmLeaseScheduleHooks \
         tests/test_shm_lease_kill_injection.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} tests/fence_shape_driver.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} benchmarks/bench_wait.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} benchmarks/bench_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} benchmarks/probe_fastpath.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} benchmarks/probe_obs_contention.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/fence_shape_driver_check {{src-paths}} tests/fence_shape_driver.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/bench_wait_check {{src-paths}} benchmarks/bench_wait.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/bench_obsring_check {{src-paths}} benchmarks/bench_obsring.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_fastpath_check {{src-paths}} benchmarks/probe_fastpath.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_obs_contention_check {{src-paths}} benchmarks/probe_obs_contention.nim 2>&1 | tee -a test-logs/lint-nim.log
     # **M8**: all three arms of the preemption study, because two of them are
     # reached only through a `-d:` flag and an arm nothing checks is an arm that
     # rots. The plain check is the CONTROL build; the two defines are the wall and
     # wall+cpu instruments.
-    nim check {{nim-flags}} {{src-paths}} benchmarks/probe_preemption.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} -d:shmLeaseRoleTiming \
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_preemption_check {{src-paths}} benchmarks/probe_preemption.nim 2>&1 | tee -a test-logs/lint-nim.log
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_preemption_check {{src-paths}} -d:shmLeaseRoleTiming \
         benchmarks/probe_preemption.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} -d:shmLeaseRoleTiming \
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_preemption_check {{src-paths}} -d:shmLeaseRoleTiming \
         -d:shmLeaseRoleCpuTiming \
         benchmarks/probe_preemption.nim 2>&1 | tee -a test-logs/lint-nim.log
-    nim check {{nim-flags}} {{src-paths}} -d:shmLeaseScheduleHooks \
+    nim check {{nim-flags}} --nimcache:{{nimcache}}/tests/test_shm_lease_hooks_check {{src-paths}} -d:shmLeaseScheduleHooks \
         tests/test_shm_lease_hooks.nim 2>&1 | tee -a test-logs/lint-nim.log
 
 # ===========================================================================
@@ -675,13 +684,13 @@ format-nim:
 # which needs a real build and is deliberately NOT a dependency of this repo.
 bench:
     @mkdir -p test-logs
-    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/bench_claim_r {{src-paths}} -d:release \
         -o:test-logs/bench_claim benchmarks/bench_claim.nim
-    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/bench_wait_r {{src-paths}} -d:release \
         -o:test-logs/bench_wait benchmarks/bench_wait.nim
-    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/bench_obsring_r {{src-paths}} -d:release \
         -o:test-logs/bench_obsring benchmarks/bench_obsring.nim
-    nim c -r {{nim-flags}} {{src-paths}} -d:release \
+    nim c -r {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_obs_contention_r {{src-paths}} -d:release \
         -o:test-logs/probe_obs_contention benchmarks/probe_obs_contention.nim
 
 # ===========================================================================
@@ -710,11 +719,11 @@ preemption-study:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p test-logs
-    nim c {{nim-flags}} {{src-paths}} -d:release \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_preemption_r {{src-paths}} -d:release \
         -o:test-logs/probe_preemption_notiming benchmarks/probe_preemption.nim
-    nim c {{nim-flags}} {{src-paths}} -d:release -d:shmLeaseRoleTiming \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_preemption_r {{src-paths}} -d:release -d:shmLeaseRoleTiming \
         -o:test-logs/probe_preemption_wall benchmarks/probe_preemption.nim
-    nim c {{nim-flags}} {{src-paths}} -d:release -d:shmLeaseRoleTiming \
+    nim c {{nim-flags}} --nimcache:{{nimcache}}/benchmarks/probe_preemption_r {{src-paths}} -d:release -d:shmLeaseRoleTiming \
         -d:shmLeaseRoleCpuTiming \
         -o:test-logs/probe_preemption_cpu benchmarks/probe_preemption.nim
     for arm in wall cpu notiming; do
@@ -727,5 +736,5 @@ bump-version version:
     printf '%s\n' "{{version}}" > version.txt
 
 clean:
-    rm -rf test-logs nimcache
+    rm -rf test-logs nimcache .nimcache
     find tests benchmarks -maxdepth 1 -type f -perm -u+x -not -name "*.nim" -delete

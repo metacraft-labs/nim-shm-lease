@@ -1,5 +1,8 @@
 # Nim build artifacts
 nimcache/
+# Per-checkout nimcache (config.nims): every Nim compile in this checkout
+# keeps its intermediate files here, never in the shared ~/.cache/nim.
+.nimcache/
 *.exe
 build/
 test-logs/
@@ -20,6 +23,7 @@ tests/test_shm_lease_arbiter_multiprocess
 tests/test_shm_lease_starvation
 tests/test_shm_lease_reclaim
 tests/test_shm_lease_kill_injection
+tests/test_nimcache_is_worktree_local
 benchmarks/bench_claim
 benchmarks/bench_wait
 benchmarks/bench_obsring
