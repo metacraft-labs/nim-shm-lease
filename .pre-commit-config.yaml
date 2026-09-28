@@ -1,0 +1,66 @@
+# THE MCL STANDARD HOOK SET (`mcl-standard-hooks`), portable committed form --
+# PARTIAL ADOPTION, AND THE SHORTFALL IS STATED RATHER THAN HIDDEN.
+#
+# metacraft-dev-guidelines/policies/repo-requirements.md §4 requires the whole
+# set, so this file is a RECORDED SHORTFALL, not a claim of compliance. What it
+# does carry is the part that had zero adoption cost and the part the campaign
+# proved fires: the two committed-binary refusals. What it does not carry is the
+# formatting tier, for the measured reason below.
+#
+# §4.1 says which adoption form is ours: a repo that consumes the devops-modules
+# flake imports `nixos-modules.modules.flake.git-hooks`; anything else -- and
+# every Windows developer -- copies the block from devops-modules'
+# `git-hooks/mcl-standard-hooks.yaml` into a committed
+# `.pre-commit-config.yaml` and pins `rev:` to a devops-modules sha. This repo
+# has no `flake.nix`, and §4.1 is explicit that this is not itself a defect:
+# "a repo that is deliberately flake-free for Windows support is not defective;
+# its fix is a committed config, not a new flake." Having NO hooks was the defect.
+#
+# Install:  prek install --install-hooks     (or: pre-commit install)
+# Run:      prek run --all-files
+#
+# WHY THESE TWO CAN LAND WITH NOTHING ELSE MOVING. Both act on ADDED files only
+# (`git diff --staged --diff-filter=A`), never on files already tracked, so they
+# cannot rewrite a byte of this repository and cannot retroactively fail it.
+# Re-verified against the versions pinned below: an added 2 MiB non-recording is
+# refused; an added `*.ct` file and an added member of a `*.ct/` directory are
+# both refused; an added 1,000,000 B non-recording is accepted; and MODIFYING an
+# already-tracked `.ct` is accepted. `--enforce-all` is deliberately not passed
+# and must not be added to "tighten" it.
+#
+# ----------------------------------------------------------------------------
+# WHAT IS MISSING, AND WHY -- MEASURED IN THIS REPO, NOT ASSUMED
+# ----------------------------------------------------------------------------
+#
+# Absent members of the set: `end-of-file-fixer`, `editorconfig-checker`,
+# `nixfmt`, `terraform-format`, `prettier`. The first is in the set's
+# committed-binaries tier and the rest in its formatting tier, but all five are
+# FORMATTERS -- they rewrite files on first adoption -- which is why they are
+# grouped together here.
+#
+# MEASURED COST: the formatting tier DOES NOT CONVERGE here.
+# `editorconfig-checker` still fails on a second pass with 12 findings in
+# `LICENSE` -- the Apache-2.0 text, whose indentation is not ours to change.
+# This repo needs an `.ecrc` exempting `LICENSE` before the formatting tier can
+# be enabled.#
+# TO FINISH THE ADOPTION: add the `- repo: local` block from
+# `git-hooks/mcl-standard-hooks.yaml` verbatim, plus `end-of-file-fixer` under
+# the pre-commit-hooks entry, deal with the cost above, and delete this section.
+
+minimum_pre_commit_version: '3.0.0'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # 1024 KB passed explicitly because UPSTREAM'S DEFAULT IS 500 KB; dropping
+      # the argument silently halves the ceiling.
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+
+  - repo: https://github.com/metacraft-labs/devops-modules
+    # Pinned to a sha, never to a branch: a hook set that changes under a repo
+    # without a commit in that repo is a hook set nobody can bisect.
+    rev: 6ba34072850f7348e1669a6daf8a0acb79669434
+    hooks:
+      - id: ban-added-ct-recordings
